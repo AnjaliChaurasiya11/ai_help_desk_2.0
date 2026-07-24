@@ -773,14 +773,26 @@ async def voice_complaint(
             detail=f"Invalid state for complaint capture: {session.state.value}",
         )
 
+    t_start = time.time()
     # Read and convert audio
+    t_read_start = time.time()
     raw_bytes = await _read_audio_with_limit(audio)
+    t_read_end = time.time()
+    
     content_type = audio.content_type or "audio/webm"
     source_format = detect_format_from_content_type(content_type)
+    
+    t_conv_start = time.time()
     wav_bytes = convert_to_wav(raw_bytes, source_format=source_format)
+    t_conv_end = time.time()
 
     # Check for silence
-    if detect_silence(wav_bytes, source_format="wav"):
+    t_vad_start = time.time()
+    is_silent = detect_silence(wav_bytes, source_format="wav")
+    t_vad_end = time.time()
+    
+    if is_silent:
+        logger.info("LATENCY: Total request time: %.0f ms", (time.time() - t_start) * 1000)
         return VoiceComplaintResponse(
             session_id=session_id,
             state=session.state.value,
@@ -792,9 +804,12 @@ async def voice_complaint(
     # Run STT
     stt = _get_stt()
     try:
+        t_stt_start = time.time()
         result = stt.transcribe(wav_bytes)
+        t_stt_end = time.time()
     except Exception as exc:
         logger.warning("STT failed for complaint in session %s (treating as silent): %s", session_id, exc)
+        logger.info("LATENCY: Total request time: %.0f ms", (time.time() - t_start) * 1000)
         return VoiceComplaintResponse(
             session_id=session_id,
             state=session.state.value,
@@ -809,6 +824,7 @@ async def voice_complaint(
     session.stt_latency_ms = result.processing_time_ms
 
     if result.is_silent or not result.text.strip():
+        logger.info("LATENCY: Total request time: %.0f ms", (time.time() - t_start) * 1000)
         return VoiceComplaintResponse(
             session_id=session_id,
             state=session.state.value,
@@ -823,6 +839,7 @@ async def voice_complaint(
 
     # ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ LLM GUARDRAIL ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Verify language + fix STT errors ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
     # ── Delegate to the shared pipeline (also used by the LiveKit adapter) ──
+    t_pipeline_start = time.time()
     proc_result = process_complaint_transcript(
         db_session=db_session,
         session_manager=session_manager,
@@ -836,8 +853,10 @@ async def voice_complaint(
         stt_confidence=result.confidence,
         stt_language=result.language,
     )
+    t_pipeline_end = time.time()
 
     if proc_result.status == "rejected":
+        logger.info("LATENCY: Total request time: %.0f ms", (time.time() - t_start) * 1000)
         return VoiceComplaintResponse(
             session_id=session_id,
             state=session.state.value,
@@ -847,6 +866,23 @@ async def voice_complaint(
             stt_processing_time_ms=result.processing_time_ms,
             prompt_text=proc_result.prompt_text,
         )
+
+    timings = getattr(proc_result, "timings", {})
+    logger.info(
+        "\n================ Voice Latency ================\n"
+        f"Audio Read         : {(t_read_end - t_read_start)*1000:.0f} ms\n"
+        f"Conversion         : {(t_conv_end - t_conv_start)*1000:.0f} ms\n"
+        f"VAD                : {(t_vad_end - t_vad_start)*1000:.0f} ms\n"
+        f"STT                : {(t_stt_end - t_stt_start)*1000:.0f} ms\n"
+        f"Embedding          : {timings.get('Embedding', 0):.0f} ms\n"
+        f"Classification     : {timings.get('Classification', 0):.0f} ms\n"
+        f"Vector Search      : {timings.get('Vector Search', 0):.0f} ms\n"
+        f"Database           : {timings.get('Database', 0):.0f} ms\n"
+        f"AI Pipeline Total  : {(t_pipeline_end - t_pipeline_start)*1000:.0f} ms\n"
+        f"----------------------------------------------\n"
+        f"TOTAL (excl TTS)   : {(time.time() - t_start)*1000:.0f} ms\n"
+        "==============================================="
+    )
 
     return VoiceComplaintResponse(
         session_id=session_id,
@@ -957,7 +993,10 @@ def voice_tts(
             detail="No TTS backend available. Install piper-tts or pyttsx3.",
         )
 
+    t_tts_start = time.time()
     audio_bytes = tts.synthesise(text, normalise=normalise)
+    t_tts_end = time.time()
+    logger.info("LATENCY: TTS generation: %.0f ms", (t_tts_end - t_tts_start) * 1000)
     if not audio_bytes:
         raise HTTPException(status_code=500, detail="TTS synthesis returned empty audio.")
 

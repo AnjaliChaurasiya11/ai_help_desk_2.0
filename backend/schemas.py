@@ -29,13 +29,9 @@ VALID_SEVERITIES = ["critical", "high", "normal", "low"]
 VALID_STATUSES = ["open", "triage", "assigned", "in_progress", "resolved", "closed", "reopened"]
 
 VALID_DEPENDENCY_NATURES = [
-    "login/access", 
-    "performance/slow", 
-    "data error", 
-    "total outage", 
-    "partial/degraded", 
-    "cosmetic/UI", 
-    "other"
+    "auth",
+    "data",
+    "network",
 ]
 
 

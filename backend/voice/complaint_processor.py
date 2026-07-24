@@ -17,6 +17,7 @@ Responsibilities:
 """
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -62,6 +63,7 @@ class ComplaintProcessingResult:
     fault_type: Optional[str] = None
     severity: Optional[str] = None
     candidates: List[VoiceCandidateApp] = field(default_factory=list)
+    timings: dict = field(default_factory=dict)
 
 
 def process_complaint_transcript(
@@ -96,16 +98,28 @@ def process_complaint_transcript(
             status="rejected",
             prompt_text=f"{reason} Please describe your IT issue again clearly.",
             corrected_transcript=raw_transcript,
+            timings={},
         )
 
     # Use the LLM-corrected text for classification
     complaint_text = guardrail_result.get("corrected_text", raw_transcript)
 
     # ── Phase 1 AI Pipeline (REUSED UNCHANGED) ──
+    t_emb_start = time.time()
     embedding = embedder.get_embedding(complaint_text)
+    t_emb_end = time.time()
+    t_emb = (t_emb_end - t_emb_start) * 1000
+
+    t_llm_start = time.time()
     fault_type = classifier.classify_fault_type(db_session, complaint_text, embedding)
     severity = classifier.classify_severity(db_session, complaint_text, embedding)
+    t_llm_end = time.time()
+    t_llm = (t_llm_end - t_llm_start) * 1000
+
+    t_search_start = time.time()
     raw_candidates = search_engine.search_candidates(db_session, embedding)
+    t_search_end = time.time()
+    t_search = (t_search_end - t_search_start) * 1000
 
     enriched_candidates: List[VoiceCandidateApp] = []
     for cand in raw_candidates:
@@ -139,6 +153,7 @@ def process_complaint_transcript(
                     ))
 
     # ── Create Intake record (same as Phase 1) ──
+    t_db_start = time.time()
     intake = Intake(
         raw_text=complaint_text,
         operator_id=operator_id,
@@ -150,6 +165,15 @@ def process_complaint_transcript(
     db_session.add(intake)
     db_session.commit()
     db_session.refresh(intake)
+    t_db_end = time.time()
+    t_db = (t_db_end - t_db_start) * 1000
+
+    timings = {
+        "Embedding": t_emb,
+        "Classification": t_llm,
+        "Vector Search": t_search,
+        "Database": t_db,
+    }
 
     # ── Update session (transition to OPERATOR_REVIEW) ──
     session_manager.transition(
@@ -182,4 +206,5 @@ def process_complaint_transcript(
         fault_type=fault_type,
         severity=severity,
         candidates=enriched_candidates,
+        timings=timings,
     )

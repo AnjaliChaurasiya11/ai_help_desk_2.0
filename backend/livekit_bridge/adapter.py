@@ -677,6 +677,14 @@ class LiveKitAdapter:
         validation = validate_service_number(stt_result.text)
 
         if validation.is_valid:
+            # Spell out the service number phonetically for read-back (R-31)
+            from voice.tts import TextToSpeechEngine
+            spelled = TextToSpeechEngine.normalise_for_speech(validation.normalised)
+            prompt = render_dynamic_prompt(
+                "confirm_service_number",
+                service_number=spelled,
+            )
+            
             self._session_manager.transition(
                 session_id,
                 SessionState.CONFIRMING_SERVICE_NUMBER,
@@ -685,36 +693,35 @@ class LiveKitAdapter:
             await self._notify(session_id, "state_change", {
                 "state": SessionState.CONFIRMING_SERVICE_NUMBER.value,
                 "service_no": validation.normalised,
+                "prompt_text": prompt,
             })
-            # Spell out the service number phonetically for read-back (R-31)
-            from voice.tts import TextToSpeechEngine
-            spelled = TextToSpeechEngine.normalise_for_speech(validation.normalised)
-            return render_dynamic_prompt(
-                "confirm_service_number",
-                service_number=spelled,
-            )
+            return prompt
         else:
             retries = self._session_manager.increment_svc_retries(session_id)
             if self._session_manager.should_fallback(session_id):
+                prompt = get_prompt_text("fallback_operator")
                 self._session_manager.transition(
                     session_id, SessionState.OPERATOR_FALLBACK
                 )
                 await self._notify(session_id, "state_change", {
                     "state": SessionState.OPERATOR_FALLBACK.value,
                     "reason": validation.error_reason,
+                    "prompt_text": prompt,
                 })
-                return get_prompt_text("fallback_operator")
+                return prompt
             else:
-                await self._notify(session_id, "state_change", {
-                    "state": SessionState.CAPTURING_SERVICE_NUMBER.value,
-                    "retries": retries,
-                    "reason": validation.error_reason,
-                })
-                return render_dynamic_prompt(
+                prompt = render_dynamic_prompt(
                     "retry_service_number",
                     attempt=retries,
                     max_attempts=MAX_SERVICE_NUMBER_RETRIES,
                 )
+                await self._notify(session_id, "state_change", {
+                    "state": SessionState.CAPTURING_SERVICE_NUMBER.value,
+                    "retries": retries,
+                    "reason": validation.error_reason,
+                    "prompt_text": prompt,
+                })
+                return prompt
 
     async def _handle_confirmation(
         self, session_id: str, stt_result
@@ -741,13 +748,15 @@ class LiveKitAdapter:
                 "transcript=%r",
                 session_id, stt_result.text[:120],
             )
+            prompt = get_prompt_text("ask_complaint")
             self._session_manager.transition(
                 session_id, SessionState.CAPTURING_COMPLAINT
             )
             await self._notify(session_id, "state_change", {
                 "state": SessionState.CAPTURING_COMPLAINT.value,
+                "prompt_text": prompt,
             })
-            return get_prompt_text("ask_complaint")
+            return prompt
 
         elif is_no and not is_yes:
             logger.info(
@@ -756,13 +765,15 @@ class LiveKitAdapter:
                 "transcript=%r",
                 session_id, stt_result.text[:120],
             )
+            prompt = get_prompt_text("ask_service_number")
             self._session_manager.transition(
                 session_id, SessionState.CAPTURING_SERVICE_NUMBER
             )
             await self._notify(session_id, "state_change", {
                 "state": SessionState.CAPTURING_SERVICE_NUMBER.value,
+                "prompt_text": prompt,
             })
-            return get_prompt_text("ask_service_number")
+            return prompt
 
         else:
             logger.info(
@@ -772,7 +783,13 @@ class LiveKitAdapter:
                 session_id, stt_result.text[:120],
             )
             # Unclear — ask again
-            return get_prompt_text("confirm_yes_no")
+            prompt = get_prompt_text("confirm_yes_no")
+            # We don't transition state, but we should update the prompt
+            await self._notify(session_id, "state_change", {
+                "state": SessionState.CONFIRMING_SERVICE_NUMBER.value,
+                "prompt_text": prompt,
+            })
+            return prompt
 
     async def _handle_another_complaint(
         self, session_id: str, stt_result
@@ -795,6 +812,7 @@ class LiveKitAdapter:
                 "transcript=%r",
                 session_id, stt_result.text[:120],
             )
+            prompt = get_prompt_text("ask_service_number")
             self._session_manager.transition(
                 session_id,
                 SessionState.CAPTURING_SERVICE_NUMBER,
@@ -802,8 +820,9 @@ class LiveKitAdapter:
             )
             await self._notify(session_id, "state_change", {
                 "state": SessionState.CAPTURING_SERVICE_NUMBER.value,
+                "prompt_text": prompt,
             })
-            return get_prompt_text("ask_service_number")
+            return prompt
 
         elif is_no and not is_yes:
             logger.info(
@@ -811,11 +830,13 @@ class LiveKitAdapter:
                 "ASK_ANOTHER_COMPLAINT → COMPLETED  transcript=%r",
                 session_id, stt_result.text[:120],
             )
+            prompt = get_prompt_text("goodbye")
             self._session_manager.transition(session_id, SessionState.COMPLETED)
             await self._notify(session_id, "state_change", {
                 "state": SessionState.COMPLETED.value,
+                "prompt_text": prompt,
             })
-            return get_prompt_text("goodbye")
+            return prompt
 
         else:
             logger.info(
@@ -823,7 +844,12 @@ class LiveKitAdapter:
                 "ASK_ANOTHER_COMPLAINT → (re-prompt, unclear)  transcript=%r",
                 session_id, stt_result.text[:120],
             )
-            return "Sorry, I didn't understand. Please say Yes or No."
+            prompt = "Sorry, I didn't understand. Please say Yes or No."
+            await self._notify(session_id, "state_change", {
+                "state": SessionState.ASK_ANOTHER_COMPLAINT.value,
+                "prompt_text": prompt,
+            })
+            return prompt
 
     async def _handle_complaint(
         self, session_id: str, session, stt_result
@@ -894,6 +920,7 @@ class LiveKitAdapter:
             await self._notify(session_id, "state_change", {
                 "state": SessionState.OPERATOR_REVIEW.value,
                 "transcript": result_data.corrected_transcript,
+                "prompt_text": result_data.prompt_text,
                 "fault_type_proposal": result_data.fault_type,
                 "severity_proposal": result_data.severity,
                 "application": result_data.candidates[0].application_name if result_data.candidates else "Unknown",
