@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { confirmTicket, confirmMultiTicket } from '../api/tickets.api';
+import { confirmTicket, confirmMultiTicket, submitIntake } from '../api/tickets.api';
 import { fetchAudioBlob } from '../api/voice.api';
 import { FAULT_TYPES, SEVERITY_LEVELS, SEVERITY_COLOR } from '../constants/enums';
 import ErrorMessage from '../components/ui/ErrorMessage';
@@ -99,7 +99,10 @@ function ClassifyReview() {
   const { intakeResponse, originalForm, ttsUrl } = state;
   const { candidates, fault_type_proposal, severity_proposal, is_repeat_caller, potential_duplicates, intake_id } = intakeResponse;
 
+  const originalComplaintRef = useRef(originalForm.raw_text);
   const [editedComplaint, setEditedComplaint] = useState(originalForm.raw_text);
+  const [reanalyzing, setReanalyzing] = useState(false);
+  const [reanalysisResult, setReanalysisResult] = useState(null);
   const audioRef = useRef(null);
 
   useEffect(() => {
@@ -127,14 +130,20 @@ function ClassifyReview() {
     };
   }, [ttsUrl]);
 
-  const sameUserDupes = (potential_duplicates || []).filter(d => d.is_same_user);
-  const diffUserDupes = (potential_duplicates || []).filter(d => !d.is_same_user);
+  // Use reanalysis result if available, otherwise fall back to original intake response
+  const activeCandidates        = reanalysisResult?.candidates        ?? candidates;
+  const activeFaultTypeProposal = reanalysisResult?.fault_type_proposal ?? fault_type_proposal;
+  const activeSeverityProposal  = reanalysisResult?.severity_proposal  ?? severity_proposal;
+  const activeDupes             = reanalysisResult?.potential_duplicates ?? (potential_duplicates || []);
 
-  const defaultTicket = () => ({
-    selectedAppId: candidates.find(c => c.is_primary)?.application_id ?? candidates[0]?.application_id ?? null,
-    relatedAppIds: candidates.filter(c => !c.is_primary).map(c => c.application_id),
-    faultType: fault_type_proposal,
-    severity: severity_proposal,
+  const sameUserDupes = activeDupes.filter(d => d.is_same_user);
+  const diffUserDupes = activeDupes.filter(d => !d.is_same_user);
+
+  const defaultTicket = (cands, faultType, severity) => ({
+    selectedAppId: (cands ?? activeCandidates).find(c => c.is_primary)?.application_id ?? (cands ?? activeCandidates)[0]?.application_id ?? null,
+    relatedAppIds: (cands ?? activeCandidates).filter(c => !c.is_primary).map(c => c.application_id),
+    faultType: faultType ?? activeFaultTypeProposal,
+    severity: severity ?? activeSeverityProposal,
     notes: '',
     noMatch: false,
   });
@@ -142,6 +151,29 @@ function ClassifyReview() {
   const [tickets,  setTickets]  = useState([defaultTicket()]);
   const [loading,  setLoading]  = useState(false);
   const [error,    setError]    = useState(null);
+
+  async function handleReanalyze() {
+    if (!editedComplaint.trim() || reanalyzing) return;
+    setReanalyzing(true);
+    setError(null);
+    try {
+      const res = await submitIntake({
+        raw_text: editedComplaint,
+        complainant_service_no: originalForm.complainant_service_no || '',
+        complainant_name:       originalForm.complainant_name       || '',
+        complainant_unit:       originalForm.complainant_unit       || '',
+        complainant_rank:       originalForm.complainant_rank       || '',
+      });
+      const freshData = res.data;
+      setReanalysisResult(freshData);
+      // Reset tickets with the new proposals
+      setTickets([defaultTicket(freshData.candidates, freshData.fault_type_proposal, freshData.severity_proposal)]);
+    } catch (e) {
+      setError(e.response?.data?.detail || e.message || 'Reanalysis failed');
+    } finally {
+      setReanalyzing(false);
+    }
+  }
 
   function updateTicket(idx, updated) {
     setTickets(prev => prev.map((t, i) => i === idx ? updated : t));
@@ -156,12 +188,14 @@ function ClassifyReview() {
   async function handleConfirm() {
     setLoading(true); setError(null);
     try {
-      const predictedAppId       = candidates.find(c => c.is_primary)?.application_id ?? null;
+      // Use the reanalysis intake_id if available (reanalysis creates a new intake row)
+      const activeIntakeId    = reanalysisResult?.intake_id    ?? intake_id;
+      const predictedAppId    = activeCandidates.find(c => c.is_primary)?.application_id ?? null;
 
       if (tickets.length === 1) {
         const t = tickets[0];
         const payload = {
-          intake_id,
+          intake_id:            activeIntakeId,
           confirmed_app_id:     t.noMatch ? null : t.selectedAppId,
           related_app_ids:      t.noMatch ? [] : t.relatedAppIds,
           // R-17: fault type/severity are kept even when no application
@@ -171,8 +205,8 @@ function ClassifyReview() {
           confirmed_severity:   t.severity,
           operator_notes:       t.notes || '',
           predicted_app_id:     predictedAppId,
-          predicted_fault_type: fault_type_proposal,
-          predicted_severity:   severity_proposal,
+          predicted_fault_type: activeFaultTypeProposal,
+          predicted_severity:   activeSeverityProposal,
           edited_raw_text:      editedComplaint,
           voice_session_id:     originalForm.voice_session_id || undefined,
         };
@@ -197,16 +231,16 @@ function ClassifyReview() {
         }
       } else {
         const payload = {
-          intake_id,
+          intake_id: activeIntakeId,
           tickets: tickets.map(t => ({
-            confirmed_app_id:     t.noMatch ? candidates[0]?.application_id : t.selectedAppId,
+            confirmed_app_id:     t.noMatch ? activeCandidates[0]?.application_id : t.selectedAppId,
             related_app_ids:      t.noMatch ? [] : t.relatedAppIds,
             confirmed_fault_type: t.noMatch ? 'other' : t.faultType,
             confirmed_severity:   t.noMatch ? 'normal' : t.severity,
             operator_notes:       t.notes || '',
             predicted_app_id:     predictedAppId,
-            predicted_fault_type: fault_type_proposal,
-            predicted_severity:   severity_proposal,
+            predicted_fault_type: activeFaultTypeProposal,
+            predicted_severity:   activeSeverityProposal,
             edited_raw_text:      editedComplaint,
           })),
         };
@@ -250,15 +284,59 @@ function ClassifyReview() {
       {error && <ErrorMessage message={error} />}
 
       <div style={card}>
-        <div style={cardTitle}>Original Complaint</div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+          <div style={cardTitle}>Original Complaint</div>
+          {reanalysisResult && (
+            <span style={{
+              fontSize: '11px', fontWeight: 600, color: '#22c55e',
+              background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.25)',
+              borderRadius: '20px', padding: '3px 10px', display: 'flex', alignItems: 'center', gap: '5px',
+            }}>
+              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#22c55e', display: 'inline-block' }} />
+              Reanalyzed
+            </span>
+          )}
+        </div>
         <textarea
           value={editedComplaint}
           onChange={(e) => setEditedComplaint(e.target.value)}
-          style={{ width: '100%', fontSize: '13px', background: 'var(--surface-2)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: '8px', padding: '12px', lineHeight: '1.7', resize: 'vertical', minHeight: '80px', fontFamily: 'inherit' }}
+          style={{ width: '100%', fontSize: '13px', background: 'var(--surface-2)', color: 'var(--text-primary)', border: `1px solid ${editedComplaint !== originalComplaintRef.current ? 'var(--accent)' : 'var(--border)'}`, borderRadius: '8px', padding: '12px', lineHeight: '1.7', resize: 'vertical', minHeight: '80px', fontFamily: 'inherit', transition: 'border-color 0.2s' }}
         />
-        <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '8px' }}>
-          Service No: <strong>{originalForm.complainant_service_no}</strong>
-          {originalForm.complainant_name && ` — ${originalForm.complainant_name}`}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '8px' }}>
+          <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+            Service No: <strong>{originalForm.complainant_service_no}</strong>
+            {originalForm.complainant_name && ` — ${originalForm.complainant_name}`}
+          </div>
+          <button
+            id="reanalyze-btn"
+            onClick={handleReanalyze}
+            disabled={reanalyzing || editedComplaint === originalComplaintRef.current}
+            style={{
+              display: 'flex', alignItems: 'center', gap: '7px',
+              padding: '7px 16px', borderRadius: '8px', border: 'none', cursor: reanalyzing || editedComplaint === originalComplaintRef.current ? 'not-allowed' : 'pointer',
+              background: editedComplaint !== originalComplaintRef.current ? 'linear-gradient(135deg, #1E90FF 0%, #0066cc 100%)' : 'var(--surface-2)',
+              color: editedComplaint !== originalComplaintRef.current ? '#fff' : 'var(--text-muted)',
+              fontSize: '12px', fontWeight: 600, transition: 'all 0.2s',
+              opacity: editedComplaint === originalComplaintRef.current ? 0.5 : 1,
+              boxShadow: editedComplaint !== originalComplaintRef.current ? '0 2px 10px rgba(30,144,255,0.35)' : 'none',
+            }}
+            title={editedComplaint === originalComplaintRef.current ? 'Edit the complaint text to enable reanalysis' : 'Re-run AI classification on edited text'}
+          >
+            {reanalyzing ? (
+              <>
+                <span style={{ width: 13, height: 13, border: '2px solid rgba(255,255,255,0.3)', borderTop: '2px solid #fff', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />
+                Analyzing...
+              </>
+            ) : (
+              <>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                </svg>
+                Reanalyze
+              </>
+            )}
+          </button>
         </div>
       </div>
 
@@ -279,7 +357,7 @@ function ClassifyReview() {
               key={i}
               index={i}
               ticket={t}
-              candidates={candidates}
+              candidates={activeCandidates}
               onUpdate={updateTicket}
               onRemove={removeTicket}
               canRemove={tickets.length > 1}

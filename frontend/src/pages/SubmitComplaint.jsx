@@ -104,7 +104,7 @@ async function handleSubmit() {
             <div style={cardTitle}>Complainant Details</div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '14px' }}>
               <div>
-                <labeel style={labelStyle}>Service Number *</labeel>
+                <label style={labelStyle}>Service Number *</label>
                 <input name="complainant_service_no" value={form.complainant_service_no}
                   onChange={handleChange} placeholder="e.g. 12345" style={inputStyle} />
               </div>

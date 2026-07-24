@@ -7,8 +7,10 @@
  * The redirect_uri tells Keycloak where to send the user BACK to after login.
  */
 
+const keycloakUrl = import.meta.env.VITE_KEYCLOAK_URL || 'http://localhost:8080';
+
 export const oidcConfig = {
-  authority: 'http://localhost:8080/realms/ai-helpdesk',
+  authority: `${keycloakUrl}/realms/ai-helpdesk`,
   client_id: 'helpdesk-frontend',
   redirect_uri: window.location.origin,
   post_logout_redirect_uri: window.location.origin,
