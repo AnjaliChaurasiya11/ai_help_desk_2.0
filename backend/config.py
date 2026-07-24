@@ -64,6 +64,15 @@ class Settings(BaseSettings):
     VOICE_SESSION_TTL: int = 1800      # seconds (30 min default)
     VOICE_MAX_SVC_RETRIES: int = 3
 
+    # Maximum audio upload size for all voice endpoints (service-number,
+    # confirm-audio, another-complaint, complaint). Requests exceeding this
+    # size are rejected with HTTP 413 before any RAM is allocated for
+    # STT/VAD processing, preventing memory exhaustion attacks.
+    # Default: 10 MB — comfortably above a 2-min opus/webm recording (~2 MB)
+    # but well below a problematic multi-GB payload.
+    # Override in .env: VOICE_MAX_AUDIO_SIZE_BYTES=5242880  (5 MB)
+    VOICE_MAX_AUDIO_SIZE_BYTES: int = 10 * 1024 * 1024  # 10 MB
+
     # -- Phase 4: LiveKit Media Transport (runtime backend flag) -----
     # Set LIVEKIT_ENABLED=true to activate real-time WebRTC media transport.
     # When false (default), the existing record/upload REST audio path

@@ -82,6 +82,31 @@ _tts_engine: Optional[TextToSpeechEngine] = None
 
 from config import settings
 
+
+async def _read_audio_with_limit(audio: UploadFile) -> bytes:
+    """
+    Read an uploaded audio file up to settings.VOICE_MAX_AUDIO_SIZE_BYTES.
+
+    Reads exactly MAX+1 bytes from the stream. If we receive MAX+1 bytes the
+    file is larger than the limit and we raise HTTP 413 immediately — no more
+    data is read into RAM and no STT/VAD processing starts.
+
+    Using read(n) instead of read() prevents a malicious or buggy client from
+    exhausting server memory with an arbitrarily large payload.
+    """
+    max_bytes = settings.VOICE_MAX_AUDIO_SIZE_BYTES
+    raw_bytes = await audio.read(max_bytes + 1)
+    if len(raw_bytes) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Audio file too large. "
+                f"Maximum allowed size is {max_bytes // (1024 * 1024)} MB."
+            ),
+        )
+    return raw_bytes
+
+
 def _get_stt() -> SpeechToTextEngine:
     global _stt_engine
     if _stt_engine is None:
@@ -240,7 +265,7 @@ async def voice_service_number(
         )
 
     # Read and convert audio
-    raw_bytes = await audio.read()
+    raw_bytes = await _read_audio_with_limit(audio)
     content_type = audio.content_type or "audio/webm"
     source_format = detect_format_from_content_type(content_type)
     wav_bytes = convert_to_wav(raw_bytes, source_format=source_format)
@@ -538,7 +563,7 @@ async def voice_confirm_audio(
         )
 
     # Read and convert audio
-    raw_bytes = await audio.read()
+    raw_bytes = await _read_audio_with_limit(audio)
     content_type = audio.content_type or "audio/webm"
     source_format = detect_format_from_content_type(content_type)
     wav_bytes = convert_to_wav(raw_bytes, source_format=source_format)
@@ -639,7 +664,7 @@ async def voice_another_complaint(
             detail=f"Invalid state for another-complaint prompt: {session.state.value}",
         )
 
-    raw_bytes = await audio.read()
+    raw_bytes = await _read_audio_with_limit(audio)
     content_type = audio.content_type or "audio/webm"
     source_format = detect_format_from_content_type(content_type)
     wav_bytes = convert_to_wav(raw_bytes, source_format=source_format)
@@ -749,7 +774,7 @@ async def voice_complaint(
         )
 
     # Read and convert audio
-    raw_bytes = await audio.read()
+    raw_bytes = await _read_audio_with_limit(audio)
     content_type = audio.content_type or "audio/webm"
     source_format = detect_format_from_content_type(content_type)
     wav_bytes = convert_to_wav(raw_bytes, source_format=source_format)
