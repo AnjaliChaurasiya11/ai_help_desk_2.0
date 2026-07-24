@@ -1,7 +1,7 @@
 import api from './axios';
 
-export const startVoiceSession = async () => {
-  return api.post('/api/voice/start');
+export const startVoiceSession = async (signal) => {
+  return api.post('/api/voice/start', undefined, { signal });
 };
 
 export const submitServiceNumberAudio = async (sessionId, audioBlob) => {

@@ -276,6 +276,19 @@ async def livekit_events(session_id: str, websocket: WebSocket):
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "payload": { "detail": "Listening for session events." }
         })
+
+        # Fix Race Condition: If the agent is already CONNECTED, replay the 'ready' event
+        # to this late-joining WebSocket so the frontend can enable the microphone.
+        from livekit_bridge.room_manager import RoomStatus
+        rm = get_room_manager()
+        if rm.get_status(session_id) == RoomStatus.CONNECTED:
+            await websocket.send_json({
+                "type": "ready",
+                "session_id": session_id,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "payload": {}
+            })
+
         # Keep connection alive until client disconnects
         while True:
             # Receive any message from client (keepalive pings, etc.)

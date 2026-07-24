@@ -1,6 +1,4 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-// ─── DIAGNOSTIC: render tracker (remove after verification) ─────────────────
-const _vsParentRenderCount = { n: 0 };
 import toast from 'react-hot-toast';
 import { startVoiceSession, submitServiceNumberAudio, submitComplaintAudio, confirmServiceNumber, submitConfirmAudio, submitAnotherComplaintAudio, submitFallback, fetchAudioBlob, getLiveKitToken } from '../../api/voice.api';
 import VoiceRecorder from './VoiceRecorder';
@@ -23,18 +21,22 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
   const isMounted       = useRef(true);
   const playbackIdRef   = useRef(0);
   const greetingDoneRef = useRef(false);
+  const abortRef        = useRef(null);   // FIX-2: abort controller for /voice/start
 
   useEffect(() => {
     isMounted.current = true;
-    initSession();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    initSession(controller.signal);
     return () => {
       isMounted.current = false;
+      controller.abort();   // FIX-2: cancel in-flight /voice/start on unmount
       playbackIdRef.current++;
       if (audioPlayerRef.current) { audioPlayerRef.current.pause(); audioPlayerRef.current.src = ''; }
     };
   }, []);
 
-  const initSession = async () => {
+  const initSession = async (signal) => {
     setIsProcessing(true);
     try {
       // R-42: resuming an existing call (looping for another complaint)
@@ -66,7 +68,7 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
         return;
       }
 
-      const res = await startVoiceSession();
+      const res = await startVoiceSession(signal);  // FIX-2: pass abort signal
       if (!isMounted.current) return;
       setSession(prev => ({
         ...prev,
@@ -82,6 +84,8 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
       // REQUIREMENT 3: Greeting khatam — ab mic on hoga
       greetingDoneRef.current = true;
     } catch (err) {
+      // FIX-2: AbortError/CanceledError is expected during StrictMode unmount — swallow silently
+      if (err?.code === 'ERR_CANCELED' || err?.name === 'AbortError' || err?.name === 'CanceledError') return;
       console.error('Session init failed:', err);
       if (isMounted.current) setSession(prev => ({ ...prev, state: 'ERROR', promptText: 'Failed to start session.' }));
     } finally {
@@ -297,25 +301,9 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
     setIsProcessing(true);
   }, []);
 
-  // ─── DIAGNOSTIC: track which session fields change between renders ─────────
-  const _diagPrevSession = useRef({});
-  useEffect(() => {
-    const cur = { state: session.state, serviceNumber: session.serviceNumber, id: session.id, livekitEnabled: session.livekitEnabled };
-    const changed = Object.entries(cur).filter(([k, v]) => _diagPrevSession.current[k] !== v).map(([k, v]) => `${k}: ${JSON.stringify(_diagPrevSession.current[k])} → ${JSON.stringify(v)}`);
-    if (changed.length > 0) {
-      const n = ++_vsParentRenderCount.n;
-      console.warn(`[DIAG] VoiceSessionPanel render #${n} — session changed:`, changed.join(' | '));
-      console.warn(`  └─ handleLiveKitStateChange deps include session.serviceNumber — this will RECREATE the callback ref.`);
-    }
-    _diagPrevSession.current = cur;
-  });
 
   return (
     <div style={{ background: '#0d1b2e', border: '1px solid rgba(30,144,255,0.3)', borderRadius: 14, padding: 20, marginBottom: 24, boxShadow: '0 0 20px rgba(30,144,255,0.1)' }}>
-      {/* DIAGNOSTIC ONSCREEN LOGS */}
-      <div id="diag-logs" style={{ position: 'fixed', top: 0, left: 0, right: 0, background: 'rgba(0,0,0,0.9)', color: 'lime', zIndex: 9999, padding: '10px', height: '300px', overflowY: 'auto', fontFamily: 'monospace', fontSize: '10px', whiteSpace: 'pre-wrap' }}>
-        ONSCREEN DIAG LOGS:<br/>
-      </div>
 
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>

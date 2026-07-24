@@ -39,6 +39,14 @@ function LiveKitAudioTransport({
     Object.assign(_prevProps, cur);
   });
 
+  // ─── STABLE CALLBACK REFS ─────────────────────────────────────────────────
+  // Store the latest callbacks so the WS handler never uses stale closures
+  // and we never need to put these callbacks in the WS useEffect deps array.
+  const callbacksRef = useRef({ onStateChange, onTranscribed, onError, onProcessing });
+  useEffect(() => {
+    callbacksRef.current = { onStateChange, onTranscribed, onError, onProcessing };
+  }, [onStateChange, onTranscribed, onError, onProcessing]);
+
   // ─── DIAGNOSTIC: mount/unmount ────────────────────────────────────────────
   useEffect(() => {
     console.log('%c[DIAG] LiveKitAudioTransport MOUNTED', 'color:lime;font-weight:bold');
@@ -73,16 +81,16 @@ function LiveKitAudioTransport({
             setIsAgentReady(true);
             break;
           case 'state_change':
-            if (onStateChange) onStateChange(msg.payload);
+            if (callbacksRef.current.onStateChange) callbacksRef.current.onStateChange(msg.payload);
             break;
           case 'transcribed':
-            if (onTranscribed) onTranscribed(msg.payload);
+            if (callbacksRef.current.onTranscribed) callbacksRef.current.onTranscribed(msg.payload);
             break;
           case 'processing':
-            if (onProcessing) onProcessing(msg.payload);
+            if (callbacksRef.current.onProcessing) callbacksRef.current.onProcessing(msg.payload);
             break;
           case 'error':
-            if (onError) onError(msg.payload);
+            if (callbacksRef.current.onError) callbacksRef.current.onError(msg.payload);
             break;
           // Other backend events (ping, speech_started, etc) can be handled here or ignored.
           default:
@@ -109,7 +117,7 @@ function LiveKitAudioTransport({
       ws.close();
       wsRef.current = null;
     };
-  }, [session_id, onStateChange, onTranscribed, onError, onProcessing]);
+  }, [session_id]); // FIX-3: callbacks removed from deps to prevent WS tear-down
 
   return (
     <div style={{ padding: "16px", border: "1px solid #e2e8f0", borderRadius: "12px", background: "#f8fafc", minHeight: "80px" }}>
