@@ -52,10 +52,9 @@ from schemas import (
 )
 
 from services.embedder import TextEmbedder
-from services.classifier import TicketClassifier
-from services.search import ApplicationSearchEngine
 from services.dependencies import ApplicationDependencyEngine
 from services.llm_client import verify_and_correct_text
+from services.pipeline import run_ai_pipeline
 
 import logging
 from voice.session import session_manager
@@ -63,10 +62,10 @@ from voice.prompts import get_prompt_text
 
 logger = logging.getLogger("routers.tickets")
 
-# Initialize the global instances so they don't load models on every request
+# embedder: used by confirm_ticket & confirm_multi_ticket for R-22 learning examples.
+# dependency_engine: used by list_tickets to resolve cascade dependencies per ticket.
+# Both are kept here; the classification pipeline (intake) uses pipeline.py's singletons.
 embedder = TextEmbedder()
-classifier = TicketClassifier()
-search_engine = ApplicationSearchEngine()
 dependency_engine = ApplicationDependencyEngine()
 
 router = APIRouter()
@@ -165,121 +164,29 @@ def create_intake(
     session.refresh(intake)
 
     # -----------------------------------------------------------------
-    # 1c. AI PIPELINE — Call Team B's functions
+    # 1c. AI PIPELINE — classify, search, expand (R-9, R-10, R-20a)
+    # Delegated to services/pipeline.py which is the single source of
+    # truth for this logic, shared with the voice complaint path.
     # -----------------------------------------------------------------
-
-    # Step 1: Generate embedding vector from corrected complaint text
-    embedding = embedder.get_embedding(complaint_text)
+    fault_type, severity, enriched_candidates, potential_duplicates, is_repeat = run_ai_pipeline(
+        session=session,
+        complaint_text=complaint_text,
+        complainant_service_no=request.complainant_service_no or "",
+    )
 
     # -----------------------------------------------------------------
-    # 1c. SEMANTIC DUPLICATE & MASS OUTAGE CHECK
+    # 1d. BUILD THE RESPONSE — Convert pipeline dicts to schema objects
     # -----------------------------------------------------------------
-    embedding_str = "[" + ",".join(map(str, embedding)) + "]"
-    
-    # Only look at tickets created in the last 4 hours to prevent stale alerts
-    time_limit = dt_lib.datetime.now(timezone.utc) - timedelta(hours=4)
-    
-    duplicate_query = text("""
-        SELECT t.ticket_number, t.complainant_service_no, l.raw_text, t.status, (l.text_embedding <=> :embedding) AS distance
-        FROM tickets t
-        JOIN learning_examples l ON t.ticket_number = l.ticket_number
-        WHERE t.status != 'resolved' 
-          AND t.created_at >= :time_limit
-          AND (l.text_embedding <=> :embedding) < 0.20
-        ORDER BY distance ASC
-        LIMIT 5
-    """)
-    dupes = session.execute(duplicate_query, {
-        "embedding": embedding_str, 
-        "time_limit": time_limit
-    }).fetchall()
-    
-    potential_duplicates = []
-    is_repeat = False
-    
-    for row in dupes:
-        is_same = (row.complainant_service_no == request.complainant_service_no)
-        dist = float(row.distance)
-        
-        # Dual thresholds: Looser for same user (0.20) to catch repeat complaints,
-        # Tighter for different user (0.10) to prevent false-positive mass outages.
-        if is_same and dist < 0.20:
-            is_repeat = True
-            
-        if (is_same and dist < 0.20) or (not is_same and dist < 0.10):
-            snippet = row.raw_text[:80] + "..." if len(row.raw_text) > 80 else row.raw_text
-            potential_duplicates.append({
-                "ticket_number": row.ticket_number,
-                "complainant_service_no": row.complainant_service_no,
-                "text_snippet": snippet,
-                "status": row.status,
-                "is_same_user": is_same
-            })
-
-    # Step 2: Classify fault type and severity using Hybrid Strategy
-    fault_type = classifier.classify_fault_type(session, complaint_text, embedding)
-    severity = classifier.classify_severity(session, complaint_text, embedding)
-
-    # Step 3: Find candidate applications via vector similarity search
-    raw_candidates = search_engine.search_candidates(session, embedding)
-    
-    enriched_candidates = []
-    for cand in raw_candidates:
-        app_obj = session.get(Application, cand["application_id"])
-        if app_obj:
-            enriched_candidates.append({
-                "application_id": app_obj.id,
-                "application_name": app_obj.name,
-                "confidence_score": cand["score"]
-            })
-
-    # Step 4: Expand dependencies based on fault type (R-10)
-    primary_candidate = enriched_candidates[0] if enriched_candidates else None
-    expanded_deps = []
-    if primary_candidate:
-        dep_ids = dependency_engine.expand_dependencies(
-            db_session=session,
-            primary_app_id=primary_candidate["application_id"],
-            fault_type=fault_type,
+    candidates: list[CandidateApp] = [
+        CandidateApp(
+            application_id=c["application_id"],
+            application_name=c["application_name"],
+            confidence_score=round(c["confidence_score"], 4),
+            is_primary=c.get("is_primary", False),
+            expansion_reason=c.get("expansion_reason"),
         )
-        for d_id in dep_ids:
-            d_app = session.get(Application, d_id)
-            if d_app:
-                expanded_deps.append({
-                    "application_id": d_id,
-                    "application_name": d_app.name,
-                    "expansion_reason": f"Cascade from {fault_type}"
-                })
-
-    # -----------------------------------------------------------------
-    # 1d. BUILD THE RESPONSE — Merge candidates + expansions
-    # -----------------------------------------------------------------
-    candidates: list[CandidateApp] = []
-
-    # Add direct candidates from vector search
-    for i, cand in enumerate(enriched_candidates):
-        candidates.append(
-            CandidateApp(
-                application_id=cand["application_id"],
-                application_name=cand["application_name"],
-                confidence_score=round(cand["confidence_score"], 4),
-                is_primary=(i == 0),  # Top result is marked as primary
-            )
-        )
-
-    # Add dependency-expanded candidates (avoid duplicates)
-    existing_app_ids = {c.application_id for c in candidates}
-    for dep in expanded_deps:
-        if dep["application_id"] not in existing_app_ids:
-            candidates.append(
-                CandidateApp(
-                    application_id=dep["application_id"],
-                    application_name=dep["application_name"],
-                    confidence_score=0.0,  # Expansion — no direct score
-                    is_primary=False,
-                    expansion_reason=dep.get("expansion_reason"),
-                )
-            )
+        for c in enriched_candidates
+    ]
 
     return IntakeResponse(
         intake_id=intake.id,

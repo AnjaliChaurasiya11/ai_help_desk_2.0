@@ -2,7 +2,7 @@ from sqlmodel import create_engine, Session
 from sqlalchemy import text
 from config import settings
 
-engine = create_engine(settings.DATABASE_URL, echo=True)
+engine = create_engine(settings.DATABASE_URL, echo=settings.DEBUG)
 
 def init_db():
     with engine.connect() as conn:
