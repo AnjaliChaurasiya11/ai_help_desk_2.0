@@ -9,14 +9,14 @@ Phase 1 classification pipeline (embedder ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€š�
 dependency expansion) WITHOUT modifying any Phase 1 code.
 
 Endpoints:
-  POST /api/voice/start            ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Start a new voice session
-  POST /api/voice/service-number   ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Upload audio ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ validate service number
-  POST /api/voice/confirm          ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Confirm/reject service number
-  POST /api/voice/complaint        ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Upload audio ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ classify complaint
-  POST /api/voice/fallback         ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Operator manual service number entry
-  GET  /api/voice/status           ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Query current session state
-  GET  /api/voice/tts              ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Dynamic TTS audio generation
-  GET  /api/voice/prompt/{key}     ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Serve pre-recorded static prompt
+  POST /api/voice/start            Start a new voice session
+  POST /api/voice/service-number   Upload audio  validate service number
+  POST /api/voice/confirm          Confirm/reject service number
+  POST /api/voice/complaint        Upload audio  classify complaint
+  POST /api/voice/fallback         Operator manual service number entry
+  GET  /api/voice/status           Query current session state
+  GET  /api/voice/tts              Dynamic TTS audio generation
+  GET  /api/voice/prompt/{key}     Serve pre-recorded static prompt
 
 Requirements Covered:
   R-30 through R-39 (full voice layer)

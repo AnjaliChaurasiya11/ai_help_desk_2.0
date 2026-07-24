@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     
     
     # VAD (Voice Activity Detection) — Silero VAD
-    VAD_DEVICE: str = "cpu"           # ✅ NEW: "cpu" on home PC, "cuda" on offline GPU PC
+    VAD_DEVICE: str = "cuda"           # ✅ NEW: "cpu" on home PC, "cuda" on offline GPU PC
 
 
     
@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     # remains the only path. The frontend reads this flag from the
     # /voice/start response (no build-time env var) and decides whether
     # to join a LiveKit room or use the legacy path.
-    LIVEKIT_ENABLED: bool = False
+    LIVEKIT_ENABLED: bool = True
     LIVEKIT_URL: str = "ws://localhost:7880"
     LIVEKIT_API_KEY: str = "helpdesk_key"
     LIVEKIT_API_SECRET: str = "helpdesk_secret_change_in_production"

@@ -69,17 +69,26 @@ class _SessionAudioState:
     frame_buffer: object                          # voice/audio.py FrameBuffer
     detector: object                              # voice/vad.py StreamingEndpointDetector
     audio_source: rtc.AudioSource                 # LiveKit output track
+    # Raw PCM accumulation buffer — stores bytes at the ORIGINAL source sample
+    # rate (e.g. 48 kHz from LiveKit). A single-shot resample is done at
+    # end_of_speech, avoiding scipy.signal.resample_poly boundary artefacts
+    # that occur when the FIR filter state is reset between small chunks.
     speech_buffer: bytearray = field(default_factory=bytearray)
+    # Last-seen inbound sample rate (updated every frame).
+    source_rate: int = 48000
     was_speaking: bool = False
     # Mic gate: when False, ALL inbound audio is silently discarded.
-    # Held closed from the moment a confirmation is accepted until
-    # publish_response() finishes streaming the TTS, preventing residual
-    # confirmation audio from bleeding into the complaint pipeline.
+    # Held closed while the background pipeline task runs (STT + TTS +
+    # publish_response), preventing incoming audio from accumulating during
+    # AI response playback. Re-enabled in the task's finally block.
     mic_enabled: bool = True
     # Handle to the adapter-recv-* asyncio.Task driving this session's
     # audio stream. Stored so connection_manager can cancel it BEFORE
     # calling room.disconnect(), preventing capture_frame on a closed source.
     recv_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    # Handle to the in-flight STT→TTS pipeline asyncio.Task (if any).
+    # Cancelled on session teardown to avoid orphaned background tasks.
+    pipeline_task: Optional[asyncio.Task] = field(default=None, repr=False)
 
 
 # ── Notify callback type ─────────────────────────────────────────────────────
@@ -152,9 +161,19 @@ class LiveKitAdapter:
         """
         Release per-session audio state when the session ends.
 
+        Cancels any in-flight pipeline task before discarding state so we
+        don't leave orphaned background tasks after teardown.
+
         Called by ConnectionManager.disconnect_agent().
         """
-        self._states.pop(session_id, None)
+        state = self._states.pop(session_id, None)
+        if state is not None:
+            if state.pipeline_task and not state.pipeline_task.done():
+                state.pipeline_task.cancel()
+                logger.debug(
+                    "Adapter: session=%s  pipeline_task cancelled on unregister",
+                    session_id,
+                )
         logger.info("Adapter: session unregistered: %s", session_id)
 
     # ------------------------------------------------------------------
@@ -185,8 +204,8 @@ class LiveKitAdapter:
         try:
             async for event in stream:
                 frame = event.frame
-                
-                # Log incoming frame metadata (requested by user)
+
+                # Log incoming frame metadata
                 raw_bytes = bytes(frame.data)
                 logger.debug(
                     "LiveKit Frame: SR=%s, Ch=%s, Samples/Ch=%s, Bytes=%s",
@@ -196,69 +215,23 @@ class LiveKitAdapter:
                 # Ensure mono: if stereo, average the channels.
                 if frame.num_channels > 1:
                     import numpy as np
-                    # Ensure the buffer length is a multiple of 2 (int16 = 2 bytes) * num_channels
                     # Interleaved: [L, R, L, R...]
                     samples = np.frombuffer(raw_bytes, dtype=np.int16)
-                    # Reshape to (samples_per_channel, num_channels)
                     samples = samples.reshape(-1, frame.num_channels)
-                    # Average across channels and cast back to int16
                     mono_samples = samples.mean(axis=1).astype(np.int16)
                     mono_bytes = mono_samples.tobytes()
                 else:
                     mono_bytes = raw_bytes
 
-                # Q4 interface: single entry point for all incoming audio
-                #
-                # Snapshot session state BEFORE the pipeline runs so we can
-                # detect a CONFIRMING_SERVICE_NUMBER → CAPTURING_COMPLAINT
-                # transition and gate the mic around publish_response().
-                _pre_snap = self._session_manager.get_session(session_id)
-                _state_before = _pre_snap.state if _pre_snap else None
-
-                response_wav = await self.process_live_audio(
+                # Q4 interface: single entry point for all incoming audio.
+                # process_live_audio() now always returns None — when end_of_speech
+                # fires it gates the mic and spawns a background pipeline task so
+                # this loop is NEVER blocked waiting for STT/TTS/playback.
+                await self.process_live_audio(
                     session_id=session_id,
                     pcm_bytes=mono_bytes,
                     sample_rate=frame.sample_rate,
                 )
-                if response_wav:
-                    # ── Mic gate: confirm → complaint transition ──────────────
-                    # Read post-pipeline state to determine whether the just-
-                    # processed utterance caused a confirmation acceptance.
-                    _post_snap = self._session_manager.get_session(session_id)
-                    _state_after = _post_snap.state if _post_snap else None
-                    _audio_state = self._states.get(session_id)
-
-                    _needs_mic_gate = (
-                        _state_before == _SessionState.CONFIRMING_SERVICE_NUMBER
-                        and _state_after  == _SessionState.CAPTURING_COMPLAINT
-                        and _audio_state is not None
-                    )
-                    if _needs_mic_gate:
-                        # Disable mic BEFORE publish_response starts streaming.
-                        _audio_state.mic_enabled = False
-                        # Flush speech_buffer, FrameBuffer leftovers, and VAD
-                        # internal state to discard any confirmation tail audio
-                        # that arrived after the end_of_speech trigger.
-                        _reset_state(_audio_state)
-                        logger.info(
-                            "[MIC GATE] session=%s  mic DISABLED — audio/VAD buffers "
-                            "flushed before CAPTURING_COMPLAINT  "
-                            "(state: %s → %s)",
-                            session_id,
-                            _state_before.value if _state_before else "?",
-                            _state_after.value  if _state_after  else "?",
-                        )
-
-                    await self.publish_response(session_id, response_wav)
-
-                    if _needs_mic_gate:
-                        # Re-enable only AFTER the full TTS has been streamed.
-                        _audio_state.mic_enabled = True
-                        logger.info(
-                            "[MIC GATE] session=%s  mic RE-ENABLED — "
-                            "ready for complaint capture",
-                            session_id,
-                        )
 
         except asyncio.CancelledError:
             logger.info(
@@ -367,11 +340,18 @@ class LiveKitAdapter:
             session_id, len(pcm_bytes), len(pcm_16k)
         )
 
-        # ── Step 2: Accumulate speech bytes in-memory ─────────────────────
-        state.speech_buffer.extend(pcm_16k)
+        # ── Step 2: Accumulate RAW (source-rate) speech bytes ───────────────
+        # Store the original bytes, NOT the resampled ones. A single-shot
+        # high-quality resample is applied to the full utterance at
+        # end_of_speech, avoiding FIR filter boundary artefacts that occur
+        # when scipy.signal.resample_poly is called on many small independent
+        # chunks without carrying filter state between calls.
+        state.speech_buffer.extend(pcm_bytes)
+        state.source_rate = sample_rate   # track last-seen sample rate
 
-        # ── Step 3: Feed into FrameBuffer → VAD ──────────────────────────
-        # Delegates to voice/audio.py (FrameBuffer) and voice/vad.py
+        # ── Step 3: Feed resampled audio into FrameBuffer → VAD ──────────
+        # VAD only needs approximate energy, so the per-frame resampled
+        # audio (pcm_16k from Step 1) is fine here.
         for vad_frame in state.frame_buffer.add_chunk(pcm_16k):
             vad_result = state.detector.process_frame(vad_frame)
 
@@ -381,11 +361,26 @@ class LiveKitAdapter:
                 await self._notify(session_id, "speech_started", {})
 
             if vad_result == "end_of_speech":
-                # ── Build in-memory WAV from accumulated PCM ──────────────
-                wav_bytes = _build_wav(state.speech_buffer)
+                # Capture raw PCM + rate BEFORE reset clears the buffer.
+                raw_pcm  = bytes(state.speech_buffer)
+                src_rate = state.source_rate
+                # Gate mic immediately — all subsequent frames are discarded
+                # by the mic_enabled check at the top of this method until
+                # _run_pipeline_task re-enables it in its finally block.
+                state.mic_enabled = False
                 _reset_state(state)
-                # ── Delegate entire voice pipeline to existing modules ─────
-                return await self._run_voice_pipeline(session_id, wav_bytes)
+                logger.info(
+                    "[MIC GATE] session=%s  mic DISABLED — end_of_speech, "
+                    "spawning pipeline task",
+                    session_id,
+                )
+                # Spawn background task — the frame loop continues pulling
+                # (and discarding) frames while STT/TTS/publish runs.
+                state.pipeline_task = asyncio.create_task(
+                    self._run_pipeline_task(session_id, raw_pcm, src_rate),
+                    name=f"adapter-pipeline-{session_id}",
+                )
+                return None
 
             elif vad_result == "timeout":
                 _reset_state(state)
@@ -395,6 +390,61 @@ class LiveKitAdapter:
                 )
 
         return None
+
+    # ------------------------------------------------------------------
+    # Private: Background pipeline task (STT → route → TTS → publish)
+    # ------------------------------------------------------------------
+
+    async def _run_pipeline_task(
+        self, session_id: str, raw_pcm: bytes, source_rate: int
+    ) -> None:
+        """
+        Background asyncio.Task spawned by process_live_audio on end_of_speech.
+
+        Performs: single-shot resample → STT → state routing → TTS → publish.
+
+        The mic gate (mic_enabled=False) is already set by process_live_audio
+        before this task is created. It is cleared in the finally block,
+        guaranteeing the mic is always re-enabled even if an exception occurs.
+
+        Running this as a background task means the receive_track frame loop
+        is never blocked — it continues draining (and discarding) LiveKit
+        frames the entire time STT/TTS/playback is running, so no audio
+        accumulates in the LiveKit buffer to flood the VAD on next utterance.
+        """
+        state = self._states.get(session_id)
+        try:
+            # ── Single-shot high-quality resample of the full utterance ──
+            # Doing this once on the complete buffer (rather than per-frame)
+            # eliminates FIR filter state discontinuities at chunk boundaries.
+            pcm_16k   = _resample_to_16khz(raw_pcm, source_rate)
+            wav_bytes  = _build_wav(pcm_16k)
+
+            response_wav = await self._run_voice_pipeline(session_id, wav_bytes)
+            if response_wav:
+                await self.publish_response(session_id, response_wav)
+
+        except asyncio.CancelledError:
+            logger.info(
+                "[PIPELINE] session=%s  pipeline task cancelled cleanly",
+                session_id,
+            )
+            raise
+
+        except Exception as exc:
+            logger.error(
+                "[PIPELINE] session=%s  pipeline task error=%s",
+                session_id, exc, exc_info=True,
+            )
+
+        finally:
+            if state is not None:
+                state.mic_enabled = True
+                state.pipeline_task = None
+            logger.info(
+                "[MIC GATE] session=%s  mic RE-ENABLED — pipeline task complete",
+                session_id,
+            )
 
     # ------------------------------------------------------------------
     # Outbound: TTS audio → LiveKit
