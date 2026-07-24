@@ -1,4 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+// ─── DIAGNOSTIC: prop reference tracker (remove after verification) ───────────
+const _prevProps = {};
 import {
   LiveKitRoom,
   RoomAudioRenderer,
@@ -26,11 +28,31 @@ function LiveKitAudioTransport({
   const [isAgentReady, setIsAgentReady] = useState(false);
   const [wsStatus, setWsStatus] = useState('connecting');
   const wsRef = useRef(null);
-  
+
+  // ─── DIAGNOSTIC: log which props changed references since last render ─────
+  useEffect(() => {
+    const cur = { onStateChange, onTranscribed, onError, onProcessing };
+    const changed = Object.keys(cur).filter(k => _prevProps[k] && _prevProps[k] !== cur[k]);
+    if (changed.length > 0) {
+      console.warn('[DIAG] LiveKitAudioTransport props changed reference:', changed, '(render-cycle will re-run WS useEffect)');
+    }
+    Object.assign(_prevProps, cur);
+  });
+
+  // ─── DIAGNOSTIC: mount/unmount ────────────────────────────────────────────
+  useEffect(() => {
+    console.log('%c[DIAG] LiveKitAudioTransport MOUNTED', 'color:lime;font-weight:bold');
+    return () => console.log('%c[DIAG] LiveKitAudioTransport UNMOUNTED', 'color:red;font-weight:bold');
+  }, []);
+
   // WebSocket Connection Management
   useEffect(() => {
     if (!session_id) return;
-    
+
+    console.warn(
+      '[DIAG] WS useEffect RAN — deps changed or first run.\n  onStateChange ref:', onStateChange?.toString().slice(0, 60),
+      '\n  onProcessing ref:', onProcessing?.toString().slice(0, 60)
+    );
     console.log(`[LiveKit Transport] Connecting WebSocket for session ${session_id}`);
     const ws = new WebSocket(`${WS_URL}/api/livekit/events/${session_id}`);
     wsRef.current = ws;
@@ -82,6 +104,7 @@ function LiveKitAudioTransport({
     };
 
     return () => {
+      console.warn('%c[DIAG] WS useEffect CLEANUP — WebSocket being destroyed and recreated', 'color:orange;font-weight:bold');
       console.log(`[LiveKit Transport] Closing WebSocket for session ${session_id}`);
       ws.close();
       wsRef.current = null;
@@ -98,6 +121,7 @@ function LiveKitAudioTransport({
       </div>
 
       {wsStatus === 'connected' && (
+        /* DIAG: LiveKitRoom is mounted when wsStatus==='connected'. Any WS cleanup flips wsStatus and unmounts this. */
         <LiveKitRoom
           serverUrl={livekit_url}
           token={livekit_token}

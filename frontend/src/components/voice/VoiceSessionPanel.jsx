@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+// ─── DIAGNOSTIC: render tracker (remove after verification) ─────────────────
+const _vsParentRenderCount = { n: 0 };
 import toast from 'react-hot-toast';
 import { startVoiceSession, submitServiceNumberAudio, submitComplaintAudio, confirmServiceNumber, submitConfirmAudio, submitAnotherComplaintAudio, submitFallback, fetchAudioBlob, getLiveKitToken } from '../../api/voice.api';
 import VoiceRecorder from './VoiceRecorder';
@@ -290,8 +292,31 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
     setSession(prev => ({ ...prev, state: 'ERROR', promptText: data.detail || 'An error occurred' }));
   }, []);
 
+  // FIX-1: stable reference — empty deps because setIsProcessing is a React dispatch (always stable)
+  const handleLiveKitProcessing = useCallback(() => {
+    setIsProcessing(true);
+  }, []);
+
+  // ─── DIAGNOSTIC: track which session fields change between renders ─────────
+  const _diagPrevSession = useRef({});
+  useEffect(() => {
+    const cur = { state: session.state, serviceNumber: session.serviceNumber, id: session.id, livekitEnabled: session.livekitEnabled };
+    const changed = Object.entries(cur).filter(([k, v]) => _diagPrevSession.current[k] !== v).map(([k, v]) => `${k}: ${JSON.stringify(_diagPrevSession.current[k])} → ${JSON.stringify(v)}`);
+    if (changed.length > 0) {
+      const n = ++_vsParentRenderCount.n;
+      console.warn(`[DIAG] VoiceSessionPanel render #${n} — session changed:`, changed.join(' | '));
+      console.warn(`  └─ handleLiveKitStateChange deps include session.serviceNumber — this will RECREATE the callback ref.`);
+    }
+    _diagPrevSession.current = cur;
+  });
+
   return (
     <div style={{ background: '#0d1b2e', border: '1px solid rgba(30,144,255,0.3)', borderRadius: 14, padding: 20, marginBottom: 24, boxShadow: '0 0 20px rgba(30,144,255,0.1)' }}>
+      {/* DIAGNOSTIC ONSCREEN LOGS */}
+      <div id="diag-logs" style={{ position: 'fixed', top: 0, left: 0, right: 0, background: 'rgba(0,0,0,0.9)', color: 'lime', zIndex: 9999, padding: '10px', height: '300px', overflowY: 'auto', fontFamily: 'monospace', fontSize: '10px', whiteSpace: 'pre-wrap' }}>
+        ONSCREEN DIAG LOGS:<br/>
+      </div>
+
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
         <span style={{ fontSize: '0.72rem', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--accent, #1E90FF)', background: 'rgba(30,144,255,0.1)', padding: '4px 10px', borderRadius: 20, border: '1px solid rgba(30,144,255,0.2)' }}>
@@ -360,7 +385,7 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
           livekit_url={session.livekitUrl}
           onStateChange={handleLiveKitStateChange}
           onTranscribed={handleLiveKitTranscribed}
-          onProcessing={() => setIsProcessing(true)}
+          onProcessing={handleLiveKitProcessing}
           onError={handleLiveKitError}
         />
       )}
