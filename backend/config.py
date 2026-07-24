@@ -23,6 +23,19 @@ class Settings(BaseSettings):
     TRANSFORMERS_OFFLINE: str = "1"
     HF_HUB_OFFLINE: str = "1"
 
+    # -- CORS -------------------------------------
+    # Explicit list of allowed browser origins.
+    # "allow_origins=['*']" conflicts with "allow_credentials=True" per the
+    # Fetch spec and is rejected by browsers on credentialed requests.
+    # Add your production frontend URL here or set CORS_ORIGINS in .env.
+    # Example .env value:
+    #   CORS_ORIGINS=["http://192.168.1.10:5173","https://helpdesk.example.mil"]
+    CORS_ORIGINS: list = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://192.168.252.172:5173",   # LAN dev host (matches frontend/.env IP)
+    ]
+
     # -- Auth (Keycloak) ---------------------
     # Set to True to enforce JWT tokens on all routes.
     # Keep False during development if Keycloak is not running.

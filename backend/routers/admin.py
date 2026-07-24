@@ -22,7 +22,7 @@ from schemas import (
     DependencyResponse,
 )
 from services.embedder import TextEmbedder
-from security import require_operator, CurrentUser
+from security import require_operator, get_current_user, CurrentUser
 
 router = APIRouter()
 embedder = TextEmbedder()
@@ -32,12 +32,12 @@ embedder = TextEmbedder()
 # =====================================================================
 
 @router.get("/applications", response_model=list[ApplicationResponse])
-def get_all_apps(session: Session = Depends(get_session)):
+def get_all_apps(session: Session = Depends(get_session), current_user: CurrentUser = Depends(get_current_user)):
     return session.exec(select(Application)).all()
 
 
 @router.get("/applications/{app_id}", response_model=ApplicationResponse)
-def get_one_app(app_id: int, session: Session = Depends(get_session)):
+def get_one_app(app_id: int, session: Session = Depends(get_session), current_user: CurrentUser = Depends(get_current_user)):
     app = session.get(Application, app_id)
     if not app:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
@@ -122,7 +122,7 @@ def add_symptom(app_id: int, request: SymptomCreate, session: Session = Depends(
 # =====================================================================
 
 @router.get("/dependencies", response_model=list[DependencyResponse])
-def get_all_deps(session: Session = Depends(get_session)):
+def get_all_deps(session: Session = Depends(get_session), current_user: CurrentUser = Depends(get_current_user)):
     return session.exec(select(ApplicationDependency)).all()
 
 
@@ -156,7 +156,7 @@ def delete_dependency(dep_id: int, session: Session = Depends(get_session), curr
 # =====================================================================
 
 @router.post("/seed", status_code=status.HTTP_200_OK)
-def seed_database(data: dict, session: Session = Depends(get_session)):
+def seed_database(data: dict, session: Session = Depends(get_session), current_user: CurrentUser = Depends(require_operator)):
     try:
             
         for app_data in data.get("applications", []):

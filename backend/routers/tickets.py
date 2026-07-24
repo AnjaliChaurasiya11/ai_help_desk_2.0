@@ -79,10 +79,25 @@ router = APIRouter()
 def _generate_ticket_number(session: Session) -> str:
     """
     Generates the next sequential ticket number in the format TIC-YYYYMM-XXXX.
-    Queries the DB to find the highest existing number for the current month.
+
+    Race-condition safety:
+      Acquires a PostgreSQL transaction-level advisory lock before reading the
+      current MAX so that concurrent requests are serialized — each waits for
+      the previous one to commit before proceeding. The lock is automatically
+      released when the enclosing transaction commits or rolls back; no manual
+      cleanup is needed.
+
+      Advisory lock key 7483921 is an arbitrary constant chosen to be unique
+      to this operation. It does not collide with any other lock in the app.
     """
     now = dt_lib.datetime.now(timezone.utc)
     prefix = f"TIC-{now.strftime('%Y%m')}-"
+
+    # Serialize concurrent ticket-number generation. pg_advisory_xact_lock
+    # blocks until it can acquire the lock exclusively, then holds it for the
+    # duration of the current transaction. This turns the read-then-increment
+    # into an atomic operation across concurrent workers.
+    session.execute(text("SELECT pg_advisory_xact_lock(7483921)"))
 
     # Find the highest ticket number for this month
     statement = (
@@ -744,6 +759,7 @@ def update_ticket(
 def get_similar_resolutions(
     ticket_number: str,
     session: Session = Depends(get_session),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """
     R-23: Complaint-to-Complaint matching.
@@ -815,6 +831,7 @@ def get_similar_resolutions(
 def get_ticket_history(
     ticket_number: str,
     session: Session = Depends(get_session),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """
     Returns the full chronological audit trail for a ticket.

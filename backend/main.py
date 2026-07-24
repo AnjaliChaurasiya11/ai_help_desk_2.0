@@ -24,7 +24,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Explicit allowlist — combining allow_origins=["*"] with
+    # allow_credentials=True violates the Fetch spec and is rejected by
+    # real browsers. Configure CORS_ORIGINS in .env for production.
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
