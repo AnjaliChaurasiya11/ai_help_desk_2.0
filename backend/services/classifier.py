@@ -3,7 +3,7 @@ from typing import Optional, List, Tuple
 from sqlmodel import Session
 from sqlalchemy import text
 from models import ClassificationConfig
-from services.llm_client import predict_fault_and_severity
+from services.llm_client import predict_fault_and_severity, classify_and_reason
 
 import logging
 logger = logging.getLogger("services.classifier")
@@ -161,3 +161,79 @@ class TicketClassifier:
         logger.info("[AI] Calling LLM for severity classification.")
         result = predict_fault_and_severity(text_content.strip())
         return result.get("severity", "normal")
+
+    # ------------------------------------------------------------------
+    # NEW context-aware entry point — used by the voice pipeline when
+    # ENABLE_AI_REASONING=True.  Returns history_hit so the caller can
+    # skip symptom/purpose enrichment queries when the shortcut fires.
+    # ------------------------------------------------------------------
+    def classify_and_reason_complaint(
+        self,
+        session: Session,
+        text_content: Optional[str],
+        embedding: List[float],
+        candidate_apps: List[dict],
+        symptoms: dict,
+        purposes: dict,
+    ) -> tuple:
+        """
+        Context-aware classification + reasoning in a single LLM call.
+
+        Returns:
+          (fault_type: str, severity: str, reasoning: dict, history_hit: bool)
+
+        reasoning dict keys:
+          fault_type, severity, confidence, summary,
+          suggested_resolution, needs_followup, followup_question
+
+        history_hit=True means no LLM was called; caller should treat
+        confidence as 1.0 and skip followup logic.
+        """
+        if not text_content or not text_content.strip():
+            default_reasoning = {
+                "fault_type": "other", "severity": "normal",
+                "confidence": 1.0, "summary": "",
+                "suggested_resolution": "", "needs_followup": False,
+                "followup_question": None,
+            }
+            return "other", "normal", default_reasoning, False
+
+        cleaned = text_content.strip()
+
+        # Phase A: history shortcut — DB only, no LLM, no extra queries
+        fault_from_history, severity_from_history = self._get_history_match_combined(session, embedding)
+
+        if fault_from_history and severity_from_history:
+            logger.info(
+                "[AI] classify_and_reason_complaint: history hit "
+                "(fault=%s, severity=%s) — LLM + enrichment skipped",
+                fault_from_history, severity_from_history,
+            )
+            reasoning = {
+                "fault_type": fault_from_history,
+                "severity": severity_from_history,
+                "confidence": 1.0,
+                "summary": "",
+                "suggested_resolution": "",
+                "needs_followup": False,
+                "followup_question": None,
+            }
+            return fault_from_history, severity_from_history, reasoning, True
+
+        # Phase B: single context-aware LLM call
+        logger.info(
+            "[AI] classify_and_reason_complaint: history miss — calling LLM with context "
+            "(candidates=%d, apps_with_symptoms=%d)",
+            len(candidate_apps), len(symptoms),
+        )
+        result = classify_and_reason(cleaned, candidate_apps, symptoms, purposes)
+
+        fault_type = fault_from_history or result.get("fault_type", "other")
+        severity   = severity_from_history or result.get("severity", "normal")
+
+        # Ensure top-level labels are consistent with the result dict
+        result["fault_type"] = fault_type
+        result["severity"]   = severity
+
+        return fault_type, severity, result, False
+

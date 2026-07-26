@@ -91,13 +91,18 @@ def run_ai_pipeline(
                 "is_same_user": is_same
             })
 
-    # Step 3: Classify fault type and severity
-    fault_type = classifier.classify_fault_type(session, complaint_text, embedding)
-    severity = classifier.classify_severity(session, complaint_text, embedding)
+    from sqlalchemy import text as sql_text
+    from config import settings
+    from services.llm_client import classify_and_reason
 
-    # Step 4: Find candidate applications via vector similarity
+    # Step 3: Classify fault type and severity
+    # Try history shortcut first (exposes hit flag to avoid redundant queries)
+    history_fault, history_severity = classifier._get_history_match_combined(session, embedding)
+    history_hit = bool(history_fault and history_severity)
+
+    # Step 4: Find candidate applications via vector similarity (always — needed for deps)
     raw_candidates = search_engine.search_candidates(session, embedding)
-    
+
     enriched_candidates = []
     for cand in raw_candidates:
         app_obj = session.get(Application, cand["application_id"])
@@ -109,6 +114,30 @@ def run_ai_pipeline(
                 "is_primary": (len(enriched_candidates) == 0),
                 "expansion_reason": None,
             })
+
+    # Reasoning / classification (one LLM call max)
+    reasoning = {}
+    if settings.ENABLE_AI_REASONING and not history_hit:
+        # Fetch symptoms + purposes for LLM context enrichment
+        from voice.complaint_processor import _fetch_app_context
+        top_ids = [c["application_id"] for c in enriched_candidates[:3]]
+        symptoms, purposes = _fetch_app_context(session, top_ids)
+
+        fault_type, severity, reasoning, _ = classifier.classify_and_reason_complaint(
+            session=session,
+            text_content=complaint_text,
+            embedding=embedding,
+            candidate_apps=enriched_candidates[:3],
+            symptoms=symptoms,
+            purposes=purposes,
+        )
+    elif history_hit:
+        fault_type  = history_fault
+        severity    = history_severity
+        reasoning   = {"confidence": 1.0, "summary": "", "suggested_resolution": ""}
+    else:
+        fault_type = classifier.classify_fault_type(session, complaint_text, embedding)
+        severity   = classifier.classify_severity(session, complaint_text, embedding)
 
     # Step 5: Expand dependencies
     primary_candidate = enriched_candidates[0] if enriched_candidates else None
@@ -131,4 +160,4 @@ def run_ai_pipeline(
                         "expansion_reason": f"Cascade from {fault_type}",
                     })
 
-    return fault_type, severity, enriched_candidates, potential_duplicates, is_repeat
+    return fault_type, severity, enriched_candidates, potential_duplicates, is_repeat, reasoning

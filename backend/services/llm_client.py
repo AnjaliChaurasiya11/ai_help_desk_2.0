@@ -402,4 +402,183 @@ def predict_fault_and_severity(complaint_text: str) -> dict:
         return {"fault_type": "other", "severity": "normal"}
     except Exception as e:
         logger.error("[LLM] Unexpected error calling vLLM for classification: %s", e)
-        return {"fault_type": "other", "severity": "normal"}
+        return {\"fault_type\": \"other\", \"severity\": \"normal\"}
+
+
+# ===========================================================================
+# PUBLIC FUNCTION 3: classify_and_reason (context-aware single LLM call)
+# ===========================================================================
+
+_CLASSIFY_AND_REASON_SYSTEM_PROMPT = """You are an expert IT support dispatcher for an Enterprise Help Desk.
+
+You will receive a complaint and retrieved context (matching applications, their known symptoms and purposes, and similar past tickets). Use ALL of this information to produce a single structured analysis.
+
+VALID FAULT TYPES (choose exactly one):
+"login/access", "performance/slow", "data error", "total outage", "partial/degraded", "other"
+
+FAULT TYPE DEFINITIONS:
+- "login/access": Cannot log in, password issues, account locked, OTP not working, SSO failure, access denied.
+- "performance/slow": Application is slow, lagging, timing out, hanging, loading forever.
+- "data error": Wrong data displayed, incorrect figures, salary mismatch, record not found, data corruption.
+- "total outage": Application completely down, server unreachable, 404/500 errors, no one can access.
+- "partial/degraded": Some features work but others are broken, partial functionality, specific page/button not working.
+- "other": Does not clearly fit into any of the above categories.
+
+VALID SEVERITIES (choose exactly one):
+"critical", "high", "normal", "low"
+
+SEVERITY DEFINITIONS:
+- "critical": Entire base or mission-critical systems are down, many users affected.
+- "high": An important workflow is broken for multiple users or a team.
+- "normal": A single user has a routine issue. DEFAULT when unclear.
+- "low": Minor cosmetic or non-blocking issue.
+
+FIELD DEFINITIONS:
+- summary: A concise 1-2 sentence human-readable description of the issue. Write in third person (e.g., "User cannot log in to the AFMS portal — likely an SSO failure.").
+- fault_type: One of the valid fault types above.
+- severity: One of the valid severities above.
+- confidence: Float 0.0-1.0 reflecting how certain you are about fault_type+severity given the complaint and context. Be conservative — use 0.5 if genuinely uncertain.
+- suggested_resolution: A concrete first-response action (1-2 sentences) drawn from the retrieved context. If no relevant context is available, write a standard triage suggestion.
+- needs_followup: Boolean. True ONLY if the complaint is genuinely ambiguous and a specific clarifying question would materially improve classification. False in all other cases.
+- followup_question: If needs_followup is true, a short, specific question to ask the caller. null otherwise.
+
+RULES:
+- Use retrieved application context heavily — it is specifically selected for this complaint.
+- If the complaint is in Hindi or Hinglish, still classify correctly.
+- Default severity to "normal" if uncertain.
+- Default fault_type to "other" if uncertain.
+- Keep summary and suggested_resolution concise and actionable.
+
+RESPONSE FORMAT — ONLY a valid JSON object, no markdown, no explanation:
+{"summary": "...", "fault_type": "...", "severity": "...", "confidence": 0.0, "suggested_resolution": "...", "needs_followup": false, "followup_question": null}"""
+
+
+def _build_reasoning_user_prompt(
+    complaint_text: str,
+    candidate_apps: list,
+    symptoms: dict,
+    purposes: dict,
+) -> str:
+    """Assemble the user-turn message injecting retrieved context compactly."""
+    lines = [f"COMPLAINT:\n{complaint_text}\n"]
+
+    if candidate_apps:
+        lines.append("RETRIEVED APPLICATIONS (ranked by semantic similarity):")
+        for i, app in enumerate(candidate_apps[:3], 1):
+            name = app.get("application_name", app.get("name", "Unknown"))
+            score = app.get("confidence_score", 0.0)
+            app_id = app.get("application_id")
+            line = f"  {i}. {name} (confidence: {score:.2f})"
+
+            syms = symptoms.get(app_id, [])
+            if syms:
+                line += f"\n     Symptoms: {'; '.join(syms[:3])}"
+
+            purps = purposes.get(app_id, [])
+            if purps:
+                line += f"\n     Purpose: {purps[0]}"
+
+            lines.append(line)
+    else:
+        lines.append("RETRIEVED APPLICATIONS: None found.")
+
+    return "\n".join(lines)
+
+
+def classify_and_reason(
+    complaint_text: str,
+    candidate_apps: list,
+    symptoms: dict,
+    purposes: dict,
+) -> dict:
+    """
+    Context-aware classification + reasoning in a single LLM inference.
+
+    Args:
+        complaint_text: The corrected STT transcript.
+        candidate_apps:  List of dicts [{application_id, application_name, confidence_score}, ...]
+                         already enriched and sorted by search_candidates().
+        symptoms:        Dict {app_id: [symptom_text, ...]} for the top candidates.
+        purposes:        Dict {app_id: [purpose_text, ...]} for the top candidates.
+
+    Returns a dict with keys:
+        fault_type, severity, confidence, summary,
+        suggested_resolution, needs_followup, followup_question
+    """
+    _FALLBACK = {
+        "fault_type": "other",
+        "severity": "normal",
+        "confidence": 0.5,
+        "summary": "",
+        "suggested_resolution": "",
+        "needs_followup": False,
+        "followup_question": None,
+    }
+
+    # ── MOCK MODE ────────────────────────────────────────────────────────────
+    if settings.MOCK_LLM:
+        logger.info("[LLM MOCK] classify_and_reason called — returning mock response.")
+        base = predict_fault_and_severity(complaint_text)  # reuse existing mock logic
+        text_lower = complaint_text.lower()
+        confidence = 0.85
+        if any(w in text_lower for w in ["not sure", "unclear", "maybe", "don't know"]):
+            confidence = 0.45
+        primary_app = candidate_apps[0].get("application_name", "the application") if candidate_apps else "the application"
+        return {
+            "fault_type": base["fault_type"],
+            "severity": base["severity"],
+            "confidence": confidence,
+            "summary": f"[MOCK] User reported a {base['fault_type']} issue with {primary_app}.",
+            "suggested_resolution": f"[MOCK] Escalate to the {primary_app} support team and verify system status.",
+            "needs_followup": confidence < 0.65,
+            "followup_question": "Could you clarify which specific feature or system is affected?" if confidence < 0.65 else None,
+        }
+
+    # ── PRODUCTION MODE ──────────────────────────────────────────────────────
+    logger.info("[LLM] Calling vLLM for context-aware classify+reason.")
+    user_prompt = _build_reasoning_user_prompt(complaint_text, candidate_apps, symptoms, purposes)
+    try:
+        raw_response = _call_llm(
+            _CLASSIFY_AND_REASON_SYSTEM_PROMPT,
+            user_prompt,
+            temperature=0.1,
+            stage_name="Classify+Reason LLM",
+        )
+        result = json.loads(raw_response)
+
+        # Validate + sanitise each field
+        fault_type = result.get("fault_type", "other")
+        severity   = result.get("severity", "normal")
+        if fault_type not in VALID_FAULT_TYPES:
+            logger.warning("[LLM] classify_and_reason: invalid fault_type '%s', defaulting.", fault_type)
+            fault_type = "other"
+        if severity not in VALID_SEVERITIES:
+            logger.warning("[LLM] classify_and_reason: invalid severity '%s', defaulting.", severity)
+            severity = "normal"
+
+        try:
+            confidence = float(result.get("confidence", 0.5))
+            confidence = max(0.0, min(1.0, confidence))
+        except (TypeError, ValueError):
+            confidence = 0.5
+
+        needs_followup = bool(result.get("needs_followup", False))
+        followup_question = result.get("followup_question") if needs_followup else None
+
+        return {
+            "fault_type": fault_type,
+            "severity": severity,
+            "confidence": confidence,
+            "summary": str(result.get("summary", "")),
+            "suggested_resolution": str(result.get("suggested_resolution", "")),
+            "needs_followup": needs_followup,
+            "followup_question": followup_question,
+        }
+
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        logger.error("[LLM] classify_and_reason: malformed response: %s", e)
+        return _FALLBACK
+    except Exception as e:
+        logger.error("[LLM] classify_and_reason: unexpected error: %s", e)
+        return _FALLBACK
+

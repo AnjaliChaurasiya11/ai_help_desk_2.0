@@ -557,7 +557,57 @@ def list_tickets(
 
 
 # =====================================================================
-# 4. PATCH /api/tickets/{ticket_number} — Update status + audit trail
+# 4. GET /api/tickets/track/{ticket_number} — Public Ticket Tracking
+# =====================================================================
+# Allows complainants to check ticket status without full authentication.
+
+@router.get("/tickets/track/{ticket_number}", response_model=TicketResponse)
+def track_ticket(
+    ticket_number: str,
+    session: Session = Depends(get_session),
+):
+    """
+    Publicly tracks a ticket by its exact ticket_number.
+    Requires no authentication, but the ticket number must be known.
+    """
+    ticket = session.exec(
+        select(Ticket).where(Ticket.ticket_number == ticket_number)
+    ).first()
+
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+
+    app_name = None
+    if ticket.primary_application_id:
+        app = session.get(Application, ticket.primary_application_id)
+        app_name = app.name if app else None
+
+    # Resolve original complaint text from the linked intake
+    complaint_text = None
+    if ticket.intake_id:
+        intake = session.get(Intake, ticket.intake_id)
+        complaint_text = intake.raw_text if intake else None
+
+    # We reuse TicketResponse as it contains exactly what we need
+    return TicketResponse(
+        ticket_number=ticket.ticket_number,
+        complainant_service_no=ticket.complainant_service_no or "",
+        complainant_rank=ticket.complainant_rank or "",
+        complainant_unit=ticket.complainant_unit or "",
+        primary_application_id=ticket.primary_application_id,
+        primary_application_name=app_name,
+        original_complaint_text=complaint_text,
+        status=ticket.status or "open",
+        fault_type=ticket.fault_type or "",
+        severity=ticket.severity or "",
+        assignee_id=ticket.assignee_id,
+        dependencies=[], # Keeping it simple for public view
+        created_at=ticket.created_at,
+    )
+
+
+# =====================================================================
+# 5. PATCH /api/tickets/{ticket_number} — Update status + audit trail
 # =====================================================================
 # Requirements: R-18 (Status transitions), R-19 (Closure requires notes),
 #               R-23 (Log resolution into history)

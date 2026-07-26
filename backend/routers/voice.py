@@ -963,6 +963,11 @@ async def voice_complaint(
         severity_proposal=proc_result.severity,
         candidates=proc_result.candidates,
         prompt_text=proc_result.prompt_text,
+        # AI Reasoning layer
+        summary=proc_result.summary,
+        suggested_resolution=proc_result.suggested_resolution,
+        needs_followup=proc_result.needs_followup,
+        followup_question=proc_result.followup_question,
     )
 
 

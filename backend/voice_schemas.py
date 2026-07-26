@@ -134,6 +134,13 @@ class VoiceComplaintResponse(BaseModel):
     # Prompt for operator
     prompt_text: str = ""
 
+    # AI Reasoning layer fields (populated when ENABLE_AI_REASONING=True)
+    summary: Optional[str] = None
+    confidence: float = 0.0
+    suggested_resolution: Optional[str] = None
+    needs_followup: bool = False
+    followup_question: Optional[str] = None
+
 
 class VoiceStatusResponse(BaseModel):
     """Response from GET /api/voice/status."""

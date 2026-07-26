@@ -1,4 +1,5 @@
 import { useAuth } from 'react-oidc-context';
+import { Link } from 'react-router-dom';
 
 export default function LoginPage() {
   const auth = useAuth();
@@ -54,6 +55,18 @@ export default function LoginPage() {
             ⚠️ {auth.error.message}
           </div>
         )}
+
+        <div style={{
+          textAlign: 'center', marginTop: 24, paddingTop: 16,
+          borderTop: '1px solid var(--border)'
+        }}>
+          <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: 8 }}>
+            Looking for an existing ticket?
+          </p>
+          <Link to="/track" className="btn btn-outline btn-sm" style={{ width: '100%', justifyContent: 'center' }}>
+            🔍 Track a Complaint
+          </Link>
+        </div>
       </div>
     </div>
   );

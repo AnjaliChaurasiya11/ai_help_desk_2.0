@@ -87,6 +87,19 @@ class Settings(BaseSettings):
     VOICE_MAX_SVC_RETRIES: int = 3
     ENABLE_LATENCY_PROFILING: bool = True # Toggle comprehensive latency reports
 
+    # -- AI Reasoning Layer (context-aware classification) --------
+    # When True the single classify+reason LLM call receives retrieved
+    # application candidates, symptoms, and purposes as context and
+    # returns a richer 7-field response.
+    # Set False to revert to the 2-field classify-only output with zero
+    # latency change.
+    ENABLE_AI_REASONING: bool = True
+
+    # Deterministic follow-up gate: if the LLM's confidence score is
+    # below this threshold the pipeline overrides needs_followup=True
+    # regardless of what the model returned.  Set to 0.0 to never ask.
+    FOLLOWUP_CONFIDENCE_THRESHOLD: float = 0.65
+
     # Maximum audio upload size for all voice endpoints (service-number,
     # confirm-audio, another-complaint, complaint). Requests exceeding this
     # size are rejected with HTTP 413 before any RAM is allocated for
