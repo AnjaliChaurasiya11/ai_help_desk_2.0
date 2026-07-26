@@ -61,9 +61,13 @@ def _get_openai_client():
 # ---------------------------------------------------------------------------
 # Internal helper — call the LLM and return the response text
 # ---------------------------------------------------------------------------
-def _call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.1) -> str:
+import time
+
+def _call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.1, stage_name: str = "LLM") -> str:
     """Make a single call to the vLLM server. Returns the raw response string."""
     client = _get_openai_client()
+    
+    t_start = time.time()
     response = client.chat.completions.create(
         model=settings.VLLM_MODEL_NAME,
         messages=[
@@ -74,6 +78,18 @@ def _call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.1) ->
         max_tokens=256,
         response_format={"type": "json_object"},  # Forces valid JSON output
     )
+    t_end = time.time()
+    
+    total_time_ms = (t_end - t_start) * 1000
+    
+    prompt_tokens = response.usage.prompt_tokens if response.usage else len(system_prompt) + len(user_prompt)
+    response_tokens = response.usage.completion_tokens if response.usage else 0
+    
+    logger.info(
+        "[%s] API Request Time: %.0f ms | Prompt Tokens: %s | Response Tokens: %s",
+        stage_name, total_time_ms, prompt_tokens, response_tokens
+    )
+    
     return response.choices[0].message.content.strip()
 
 
@@ -173,7 +189,7 @@ def verify_and_correct_text(raw_text: str) -> dict:
     # ── PRODUCTION MODE ──────────────────────────────────────────────────────
     logger.info("[LLM] Calling vLLM to verify complaint text.")
     try:
-        raw_response = _call_llm(_VERIFY_SYSTEM_PROMPT, raw_text)
+        raw_response = _call_llm(_VERIFY_SYSTEM_PROMPT, raw_text, stage_name="Complaint Verification LLM")
         result = json.loads(raw_response)
 
         # Validate the response structure
@@ -244,7 +260,7 @@ def extract_service_number(raw_text: str) -> Optional[str]:
     logger.info("[LLM] Calling vLLM to extract service number.")
     system_prompt = _build_extract_svc_system_prompt()
     try:
-        raw_response = _call_llm(system_prompt, raw_text)
+        raw_response = _call_llm(system_prompt, raw_text, stage_name="Service Number Extraction LLM")
         result = json.loads(raw_response)
         
         svc_no = result.get("service_number")
@@ -262,7 +278,13 @@ def extract_service_number(raw_text: str) -> Optional[str]:
 
 
 
+# ---------------------------------------------------------------------------
+# Classification system prompt — built ONCE at module import and reused.
+# These lists never change at runtime, so there is no reason to rebuild the
+# f-string on every LLM call.
+# ---------------------------------------------------------------------------
 def _build_classify_system_prompt() -> str:
+    """Build the classification prompt. Called once at module load."""
     fault_list = ", ".join([f'"{f}"' for f in VALID_FAULT_TYPES])
     severity_list = ", ".join([f'"{s}"' for s in VALID_SEVERITIES])
     return f"""You are an expert IT support dispatcher for an Enterprise Help Desk.
@@ -316,6 +338,10 @@ You MUST respond with ONLY a valid JSON object in this exact format:
 Do NOT include any explanation, markdown, or text outside of the JSON object."""
 
 
+# Module-level cached prompt — built exactly once.
+_CLASSIFY_SYSTEM_PROMPT: str = _build_classify_system_prompt()
+
+
 
 def predict_fault_and_severity(complaint_text: str) -> dict:
     """
@@ -354,9 +380,8 @@ def predict_fault_and_severity(complaint_text: str) -> dict:
 
     # ── PRODUCTION MODE ──────────────────────────────────────────────────────
     logger.info("[LLM] Calling vLLM to classify fault_type and severity.")
-    system_prompt = _build_classify_system_prompt()
     try:
-        raw_response = _call_llm(system_prompt, complaint_text)
+        raw_response = _call_llm(_CLASSIFY_SYSTEM_PROMPT, complaint_text, stage_name="Fault Classification LLM")
         result = json.loads(raw_response)
 
         # Validate the response values are from the allowed sets

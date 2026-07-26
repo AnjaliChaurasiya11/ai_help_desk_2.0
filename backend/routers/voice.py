@@ -40,6 +40,7 @@ from voice.session import SessionState, MAX_SERVICE_NUMBER_RETRIES, session_mana
 from voice.validators import validate_service_number
 from voice.audio import convert_to_wav, detect_silence, detect_format_from_content_type, FrameBuffer
 from voice.vad import StreamingEndpointDetector
+from voice.latency_reporter import LatencyReport, emit_report
 
 # Phase 3 telephony modules
 from services.telephony.dtmf_decoder import StreamingDTMFDetector, DTMFBlockBuffer
@@ -113,7 +114,9 @@ def _get_stt() -> SpeechToTextEngine:
         _stt_engine = SpeechToTextEngine(
             model_size=settings.STT_MODEL_SIZE,
             device=settings.STT_DEVICE,
-            compute_type=settings.STT_COMPUTE_TYPE
+            compute_type=settings.STT_COMPUTE_TYPE,
+            beam_size=settings.STT_BEAM_SIZE,
+            language=settings.STT_LANGUAGE_SVC_NUM or None,
         )
     return _stt_engine
 
@@ -264,14 +267,26 @@ async def voice_service_number(
             detail=f"Invalid state for service number capture: {session.state.value}",
         )
 
+    t_start = time.time()
+    
     # Read and convert audio
+    t_read_start = time.time()
     raw_bytes = await _read_audio_with_limit(audio)
+    t_read_end = time.time()
+    
     content_type = audio.content_type or "audio/webm"
     source_format = detect_format_from_content_type(content_type)
+    
+    t_conv_start = time.time()
     wav_bytes = convert_to_wav(raw_bytes, source_format=source_format)
+    t_conv_end = time.time()
 
     # Check for silence
-    if detect_silence(wav_bytes, source_format="wav"):
+    t_vad_start = time.time()
+    is_silent = detect_silence(wav_bytes, source_format="wav")
+    t_vad_end = time.time()
+    
+    if is_silent:
         retries = session_manager.increment_svc_retries(session_id)
 
         if session_manager.should_fallback(session_id):
@@ -307,7 +322,9 @@ async def voice_service_number(
     # Run STT
     stt = _get_stt()
     try:
+        t_stt_start = time.time()
         result = stt.transcribe(wav_bytes)
+        t_stt_end = time.time()
     except Exception as exc:
         logger.warning("STT failed for session %s (treating as silent): %s", session_id, exc)
         # Don't crash with 500 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â treat any STT error as a silent/empty recording
@@ -385,7 +402,34 @@ async def voice_service_number(
         )
 
     # Validate service number
+    t_val_start = time.time()
     validation = validate_service_number(result.text)
+    t_val_end = time.time()
+
+    # ── Consolidated latency report ──────────────────────────────────────
+    _report = LatencyReport(
+        endpoint   = "service-number",
+        session_id = session_id,
+        fsm_state  = session.state.value,
+    )
+    _report.mark("audio_read",       (t_read_end - t_read_start) * 1000)
+    _report.mark("audio_conversion", (t_conv_end - t_conv_start) * 1000)
+    _report.mark("vad",              (t_vad_end  - t_vad_start)  * 1000)
+    _report.mark("stt",              (t_stt_end  - t_stt_start)  * 1000)
+    _report.mark("svc_extraction",   (t_val_end  - t_val_start)  * 1000)
+    # Whisper diagnostics — duration values come from TranscriptionResult / faster-whisper info
+    stt_engine = _get_stt()
+    speech_dur = sum(s.end - s.start for s in result.segments)
+    _report.set_whisper_info(
+        model_size  = stt_engine.model_size,
+        beam_size   = stt_engine.beam_size,
+        audio_dur_s = result.duration_seconds,
+        speech_dur_s= speech_dur,
+        language    = result.language,
+        decode_ms   = result.processing_time_ms,
+    )
+    emit_report(_report, logger)
+    # ────────────────────────────────────────────────────────────────────
 
     if validation.is_valid:
         # Store and move to confirmation state
@@ -868,21 +912,44 @@ async def voice_complaint(
         )
 
     timings = getattr(proc_result, "timings", {})
-    logger.info(
-        "\n================ Voice Latency ================\n"
-        f"Audio Read         : {(t_read_end - t_read_start)*1000:.0f} ms\n"
-        f"Conversion         : {(t_conv_end - t_conv_start)*1000:.0f} ms\n"
-        f"VAD                : {(t_vad_end - t_vad_start)*1000:.0f} ms\n"
-        f"STT                : {(t_stt_end - t_stt_start)*1000:.0f} ms\n"
-        f"Embedding          : {timings.get('Embedding', 0):.0f} ms\n"
-        f"Classification     : {timings.get('Classification', 0):.0f} ms\n"
-        f"Vector Search      : {timings.get('Vector Search', 0):.0f} ms\n"
-        f"Database           : {timings.get('Database', 0):.0f} ms\n"
-        f"AI Pipeline Total  : {(t_pipeline_end - t_pipeline_start)*1000:.0f} ms\n"
-        f"----------------------------------------------\n"
-        f"TOTAL (excl TTS)   : {(time.time() - t_start)*1000:.0f} ms\n"
-        "==============================================="
+
+    # ── Consolidated latency report ──────────────────────────────────────
+    _report = LatencyReport(
+        endpoint   = "complaint",
+        session_id = session_id,
+        fsm_state  = SessionState.OPERATOR_REVIEW.value,
     )
+    _report.mark("audio_read",       (t_read_end      - t_read_start)      * 1000)
+    _report.mark("audio_conversion", (t_conv_end      - t_conv_start)      * 1000)
+    _report.mark("vad",              (t_vad_end       - t_vad_start)       * 1000)
+    _report.mark("stt",              (t_stt_end       - t_stt_start)       * 1000)
+    if timings.get("Guardrail (LLM)"):
+        _report.mark("guardrail_llm",    timings["Guardrail (LLM)"])
+    if timings.get("Embedding"):
+        _report.mark("embedding",        timings["Embedding"])
+    if timings.get("Vector Search"):
+        _report.mark("vector_search",    timings["Vector Search"])
+    if timings.get("Classification"):
+        _report.mark("classification",   timings["Classification"])
+    if timings.get("Dependencies"):
+        _report.mark("dependencies",     timings["Dependencies"])
+    if timings.get("Database"):
+        _report.mark("database",         timings["Database"])
+    # Whisper diagnostics
+    stt_engine = _get_stt()
+    speech_dur = sum(s.end - s.start for s in result.segments)
+    _report.complaint_len = len(complaint_text)
+    _report.set_whisper_info(
+        model_size   = stt_engine.model_size,
+        beam_size    = stt_engine.beam_size,
+        audio_dur_s  = result.duration_seconds,
+        speech_dur_s = speech_dur,
+        language     = result.language,
+        decode_ms    = result.processing_time_ms,
+    )
+    emit_report(_report, logger)
+    # ────────────────────────────────────────────────────────────────────
+
 
     return VoiceComplaintResponse(
         session_id=session_id,

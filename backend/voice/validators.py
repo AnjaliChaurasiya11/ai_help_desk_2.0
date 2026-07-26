@@ -174,13 +174,20 @@ Do NOT include any explanation, markdown, or text outside of the JSON object."""
 def extract_service_number(raw_text: str) -> Optional[str]:
     """
     Extract a 5-digit service number from raw STT transcript.
-    Uses LLM if available, else falls back to regex normaliser.
+    Uses Hybrid Strategy: tries regex first, falls back to LLM if needed.
     """
+    # 1. Fast Path: Regex
+    fast_result = normalise_service_number(raw_text)
+    if fast_result and len(fast_result) == 5:
+        logger.info("[HYBRID] Service number extracted via regex: %s", fast_result)
+        return fast_result
+
+    # 2. Slow Path: LLM fallback
     if settings.MOCK_LLM:
         logger.info("[LLM MOCK] extract_service_number: using regex fallback.")
         return normalise_service_number(raw_text)
 
-    logger.info("[LLM] Calling LLM to extract service number.")
+    logger.info("[LLM] Calling LLM to extract service number (hybrid fallback).")
     system_prompt = _build_extract_svc_system_prompt()
     try:
         raw_response = _call_llm(system_prompt, raw_text)

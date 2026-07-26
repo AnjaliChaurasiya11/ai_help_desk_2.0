@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import toast from "react-hot-toast";
 
-function VoiceRecorder({ onRecordingComplete, onRecordingStart, isProcessing = false }) {
+function VoiceRecorder({ onRecordingComplete, onRecordingStart, isProcessing = false, audioPlaying = false }) {
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState("Starting microphone...");
   const isRecordingRef = useRef(false);
@@ -101,18 +101,24 @@ function VoiceRecorder({ onRecordingComplete, onRecordingStart, isProcessing = f
     };
   }, []);
 
+  // Initial auto-start — waits for both isProcessing and audioPlaying to be false.
   useEffect(() => {
-    const t = setTimeout(() => { if (!isProcessing && !isRecordingRef.current) startRecording(); }, 2500);
+    const t = setTimeout(() => {
+      if (!isProcessing && !audioPlaying && !isRecordingRef.current) startRecording();
+    }, 2500);
     return () => clearTimeout(t);
   }, []); // eslint-disable-line
 
+  // Re-arm after processing finishes OR audio playback ends (barge-in recovery).
   useEffect(() => {
     if (isFirstRender.current) { isFirstRender.current = false; return; }
-    if (!isProcessing && !isRecordingRef.current) {
-      const t = setTimeout(() => { if (!isRecordingRef.current) startRecording(); }, 2000);
+    if (!isProcessing && !audioPlaying && !isRecordingRef.current) {
+      const t = setTimeout(() => {
+        if (!isRecordingRef.current && !audioPlaying) startRecording();
+      }, 400);  // 400 ms matches the barge-in debounce in VoiceSessionPanel
       return () => clearTimeout(t);
     }
-  }, [isProcessing]); // eslint-disable-line
+  }, [isProcessing, audioPlaying]); // eslint-disable-line
 
   return (
     <div style={{padding:"16px",border:"1px solid #e2e8f0",borderRadius:"12px",background:"#f8fafc",display:"flex",justifyContent:"center",alignItems:"center",minHeight:"80px"}}>

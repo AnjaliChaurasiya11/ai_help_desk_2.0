@@ -179,7 +179,7 @@ FALLBACK_TEXT = {
     "goodbye": "Thank you. Your ticket has been created. Please note your ticket number.",
     "confirm_yes_no": "Please say yes or no.",
     "processing": "Please wait. Your request is being processed.",
-    "ask_another_complaint": "Do you have another complaint to report? Please say yes or no, or press 1 for yes, 2 for no.",
+    "ask_another_complaint": "Do you have another complaint to report? Please say yes or no.",
 }
 
 

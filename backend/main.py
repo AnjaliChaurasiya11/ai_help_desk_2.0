@@ -1,18 +1,39 @@
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from routers.admin import router as admin_router
 from routers.tickets import router as tickets_router
-from routers.voice import router as voice_router
+from routers.voice import router as voice_router, _get_stt
 from routers.livekit import router as livekit_router
 from security import get_current_user, CurrentUser, require_operator
 from config import settings
 import uvicorn
 
-# Without this, every logger.info() call in the app (voice session FSM
-# transitions, STT/TTS timing, etc.) is silently dropped — the root
-# logger defaults to WARNING with no handler attached.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+_startup_logger = logging.getLogger("startup")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Warm up heavy models before the first request arrives."""
+    _startup_logger.info("[STARTUP] Preloading Whisper STT model...")
+    try:
+        from services.embedder import TextEmbedder
+        _startup_logger.info("[STARTUP] Preloading Embedding model...")
+        TextEmbedder().preload()
+        _startup_logger.info("[STARTUP] Embedding model ready.")
+        
+        stt = _get_stt()
+        stt.preload()
+        _startup_logger.info("[STARTUP] Whisper model ready.")
+    except Exception as exc:
+        # Non-fatal: server still starts; first call will load the model lazily.
+        _startup_logger.warning("[STARTUP] Whisper preload failed (will lazy-load): %s", exc)
+    yield
+    # Shutdown — nothing to clean up (model freed by GC).
+
 
 app = FastAPI(
     title="AI Help Desk",
@@ -20,6 +41,7 @@ app = FastAPI(
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

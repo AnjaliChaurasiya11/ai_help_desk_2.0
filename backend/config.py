@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # -- Auth (Keycloak) ---------------------
     # Set to True to enforce JWT tokens on all routes.
     # Keep False during development if Keycloak is not running.
-    AUTH_ENABLED: bool = True
+    AUTH_ENABLED: bool = False
     KEYCLOAK_URL: str = "http://localhost:8080"
     KEYCLOAK_REALM: str = "ai-helpdesk"
     KEYCLOAK_CLIENT_ID: str = "helpdesk-frontend"
@@ -49,20 +49,43 @@ class Settings(BaseSettings):
     STT_MODEL_SIZE: str = "medium"
     STT_DEVICE: str = "auto"          # "auto", "cuda", "cpu"
     STT_COMPUTE_TYPE: str = "default" # "default", "float16", "int8", "float32"
-    STT_KEEP_MODEL_LOADED: bool = False    #True  = keep in memory (offline GPU PC, faster response)
-    
-    
+    STT_KEEP_MODEL_LOADED: bool = True # True = keep model resident (no first-call reload penalty)
+    STT_BEAM_SIZE: int = 1            # 1 = greedy (fastest), 5 = more accurate but ~2x slower
+
+    # Language hints for Whisper — None/"" means auto-detect per utterance.
+    # Set to "en" to skip language identification and gain ~50 ms per call.
+    # Our users may speak English, Hindi, or Hinglish, so auto-detect is the
+    # safe default.  Switch per-context via .env once real latency data exists.
+    STT_LANGUAGE_SVC_NUM: str = ""    # "" = auto-detect for service-number capture
+    STT_LANGUAGE_COMPLAINT: str = ""  # "" = auto-detect for complaint transcription
+
+    # VAD parameters — passed directly to faster-whisper's built-in Silero VAD.
+    # Production defaults are kept at faster-whisper's own defaults so we never
+    # truncate slower speakers.  Tune these after reviewing real latency reports.
+    #   min_silence_duration_ms : ms of silence to mark end-of-speech segment
+    #   speech_pad_ms           : padding added before and after detected speech
+    #   threshold               : Silero speech probability threshold (0.0–1.0)
+    VAD_MIN_SILENCE_MS: int = 2000    # faster-whisper default
+    VAD_SPEECH_PAD_MS: int = 400      # faster-whisper default
+    VAD_THRESHOLD: float = 0.5        # faster-whisper default
+
+    # Streaming VAD (StreamingEndpointDetector) — controls how long the browser
+    # keeps the mic open before auto-stopping.  These do NOT affect STT accuracy.
+    VAD_STREAMING_SILENCE_MS: int = 800   # original default (unchanged)
+    VAD_STREAMING_MAX_WAIT_MS: int = 8000 # original default (unchanged)
+
     # VAD (Voice Activity Detection) — Silero VAD
-    VAD_DEVICE: str = "cuda"           # ✅ NEW: "cpu" on home PC, "cuda" on offline GPU PC
+    VAD_DEVICE: str = "cuda"           # "cpu" on home PC, "cuda" on offline GPU PC
 
 
-    
+
     # TTS (Text-to-Speech)
     TTS_BACKEND: str = "auto"          # "piper", "sapi5", "auto"
 
     # Voice session
     VOICE_SESSION_TTL: int = 1800      # seconds (30 min default)
     VOICE_MAX_SVC_RETRIES: int = 3
+    ENABLE_LATENCY_PROFILING: bool = True # Toggle comprehensive latency reports
 
     # Maximum audio upload size for all voice endpoints (service-number,
     # confirm-audio, another-complaint, complaint). Requests exceeding this
@@ -91,17 +114,19 @@ class Settings(BaseSettings):
 
     # -- Phase 3: LLM Guardrail & Classification ----
     # The vLLM server URL exposed by the air-gapped environment.
-    # Example: "http://10.0.0.5:8001/v1"
-    VLLM_API_URL: str = "http://localhost:8010/v1"
-    # The model name as registered on the vLLM server.
-    VLLM_MODEL_NAME: str = "google/gemma-4-31B-it"
+
+    # VLLM_API_URL: str = "http://localhost:8010/v1"
+    # VLLM_MODEL_NAME: str = "g"
+    VLLM_API_URL: str = "http://localhost:11434/v1"
+    VLLM_MODEL_NAME: str = "qwen2.5:7b" 
+
     # API key if the vLLM server requires one (leave blank if not needed).
     VLLM_API_KEY: str = "none"
     # --- OFFLINE DEVELOPMENT FLAG ---
     # Set to True at home to skip LLM network calls entirely.
     # The system will return a realistic mock response so the UI can be built
     # and tested without needing access to the air-gapped vLLM server.
-    MOCK_LLM: bool = True
+    MOCK_LLM: bool = False
 
     class Config:
         env_file = ".env"

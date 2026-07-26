@@ -91,14 +91,17 @@ def process_complaint_transcript(
     embedder, classifier, search_engine, dependency_engine = _get_services()
 
     # ── LLM GUARDRAIL — verify language + fix STT errors ──
+    t_guardrail_start = time.time()
     guardrail_result = verify_and_correct_text(raw_transcript)
+    t_guardrail = (time.time() - t_guardrail_start) * 1000
+    
     if guardrail_result["status"] == "rejected":
         reason = guardrail_result.get("reason", "Complaint could not be understood.")
         return ComplaintProcessingResult(
             status="rejected",
             prompt_text=f"{reason} Please describe your IT issue again clearly.",
             corrected_transcript=raw_transcript,
-            timings={},
+            timings={"Guardrail (LLM)": t_guardrail},
         )
 
     # Use the LLM-corrected text for classification
@@ -107,19 +110,18 @@ def process_complaint_transcript(
     # ── Phase 1 AI Pipeline (REUSED UNCHANGED) ──
     t_emb_start = time.time()
     embedding = embedder.get_embedding(complaint_text)
-    t_emb_end = time.time()
-    t_emb = (t_emb_end - t_emb_start) * 1000
+    t_emb = (time.time() - t_emb_start) * 1000
 
-    t_llm_start = time.time()
-    fault_type = classifier.classify_fault_type(db_session, complaint_text, embedding)
-    severity = classifier.classify_severity(db_session, complaint_text, embedding)
-    t_llm_end = time.time()
-    t_llm = (t_llm_end - t_llm_start) * 1000
+    # Single combined classification call:
+    #   - 1 pgvector DB query (history lookup for both fault_type + severity)
+    #   - At most 1 LLM call (was previously 2 separate calls)
+    t_history_start = time.time()
+    fault_type, severity = classifier.classify_complaint(db_session, complaint_text, embedding)
+    t_classification = (time.time() - t_history_start) * 1000
 
     t_search_start = time.time()
     raw_candidates = search_engine.search_candidates(db_session, embedding)
-    t_search_end = time.time()
-    t_search = (t_search_end - t_search_start) * 1000
+    t_search = (time.time() - t_search_start) * 1000
 
     enriched_candidates: List[VoiceCandidateApp] = []
     for cand in raw_candidates:
@@ -134,6 +136,7 @@ def process_complaint_transcript(
 
     # Expand dependencies off the primary candidate
     primary_candidate = enriched_candidates[0] if enriched_candidates else None
+    t_dep_start = time.time()
     if primary_candidate:
         dep_ids = dependency_engine.expand_dependencies(
             db_session=db_session,
@@ -168,10 +171,14 @@ def process_complaint_transcript(
     t_db_end = time.time()
     t_db = (t_db_end - t_db_start) * 1000
 
+    t_dep = (time.time() - t_dep_start) * 1000
+
     timings = {
+        "Guardrail (LLM)": t_guardrail,
         "Embedding": t_emb,
-        "Classification": t_llm,
+        "Classification": t_classification,
         "Vector Search": t_search,
+        "Dependencies": t_dep,
         "Database": t_db,
     }
 

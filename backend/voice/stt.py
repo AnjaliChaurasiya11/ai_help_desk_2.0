@@ -77,13 +77,13 @@ class SpeechToTextEngine:
         return cls._instance
 
     def __init__(self, model_size: str = "medium", device: str = "auto",
-                 compute_type: str = "float16"):
+                 compute_type: str = "float16", beam_size: int = 1,
+                 language: Optional[str] = None):
         if hasattr(self, "_initialised"):
             return
         self._initialised = True
 
         # Resolve model path relative to this file
-        # backend/voice/stt.py ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ backend/local_models/whisper-medium-ct2
         current_dir = os.path.dirname(os.path.abspath(__file__))
         self.model_dir = os.path.normpath(
             os.path.join(current_dir, "..", "local_models", f"whisper-{model_size}-ct2")
@@ -92,15 +92,17 @@ class SpeechToTextEngine:
         self.model_size = model_size
         self.device = device
         self.compute_type = compute_type
+        self.beam_size = beam_size       # default beam width (1 = greedy)
+        self.language = language          # None = auto-detect per utterance
         self._model = None
 
         logger.info(
-            "STT engine configured: model_dir=%s  device=%s  compute_type=%s",
-            self.model_dir, self.device, self.compute_type,
+            "STT engine configured: model_dir=%s  device=%s  compute_type=%s  beam_size=%d",
+            self.model_dir, self.device, self.compute_type, self.beam_size,
         )
 
     # ------------------------------------------------------------------
-    # Lazy model loading ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â defers GPU memory allocation until first use
+    # Lazy model loading — defers GPU memory allocation until first use
     # ------------------------------------------------------------------
     def _ensure_model(self):
         """Load the model on first transcription request (lazy loading)."""
@@ -143,6 +145,19 @@ class SpeechToTextEngine:
             logger.error("Failed to load STT model: %s", exc, exc_info=True)
             raise RuntimeError(f"STT model loading failed: {exc}") from exc
 
+    def preload(self) -> None:
+        """
+        Eagerly load the Whisper model into memory.
+
+        Call this from the FastAPI startup event so the first caller never
+        pays the model-loading cost.  Safe to call multiple times — a guard
+        inside _ensure_model() makes subsequent calls no-ops.
+        """
+        t0 = time.perf_counter()
+        self._ensure_model()
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.info("[STARTUP] Whisper model preloaded in %.0f ms", elapsed)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -151,8 +166,9 @@ class SpeechToTextEngine:
         audio_bytes: bytes,
         language: Optional[str] = None,
         *,
-        beam_size: int = 1,
+        beam_size: Optional[int] = None,
         vad_filter: bool = True,
+        vad_parameters: Optional[dict] = None,
         word_timestamps: bool = False,
     ) -> TranscriptionResult:
         """
@@ -163,11 +179,17 @@ class SpeechToTextEngine:
         audio_bytes : bytes
             Raw audio file content (WAV, WebM, or any ffmpeg-supported format).
         language : str, optional
-            ISO-639-1 code ("en", "hi").  None = auto-detect.
-        beam_size : int
-            Beam search width.  Higher = more accurate but slower.
+            ISO-639-1 code ("en", "hi").  None = auto-detect per utterance.
+            Falls back to self.language if not provided.
+        beam_size : int, optional
+            Beam search width.  Overrides self.beam_size if provided.
+            1 = greedy / fastest, 5 = more accurate but ~2x slower.
         vad_filter : bool
-            Enable Silero VAD to skip silent chunks ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â reduces hallucination.
+            Enable Silero VAD to skip silent chunks — reduces hallucination.
+        vad_parameters : dict, optional
+            Override Silero VAD params, e.g.:
+            {"min_silence_duration_ms": 300, "speech_pad_ms": 200}.
+            Unmapped keys are forwarded directly to faster-whisper.
         word_timestamps : bool
             Whether to compute per-word timestamps (slower).
 
@@ -178,11 +200,13 @@ class SpeechToTextEngine:
         """
         self._ensure_model()
 
-        t_start = time.perf_counter()   # ✅ ADD
-        
-        t_end = time.perf_counter()     # ✅ ADD
-        print(f"[TIMING] Total transcribe() time: {(t_end-t_start)*1000:.0f}ms")   # ✅ ADD
-        
+        # Resolve effective language and beam size
+        effective_language = language if language is not None else self.language
+        effective_language = effective_language or None  # empty string → None
+        effective_beam = beam_size if beam_size is not None else self.beam_size
+
+        t_total_start = time.perf_counter()
+
         # Write bytes to a temp file because faster-whisper expects a path
         # or numpy array.  Using tempfile avoids holding large buffers.
         tmp_path = None
@@ -197,9 +221,10 @@ class SpeechToTextEngine:
 
             segments_gen, info = self._model.transcribe(
                 tmp_path,
-                language=language,
-                beam_size=beam_size,
+                language=effective_language,
+                beam_size=effective_beam,
                 vad_filter=vad_filter,
+                vad_parameters=vad_parameters or {},
                 word_timestamps=word_timestamps,
             )
 
@@ -248,6 +273,11 @@ class SpeechToTextEngine:
                 result.language, result.confidence, result.is_silent,
                 result.processing_time_ms, result.text[:80],
             )
+
+            t_total_end = time.perf_counter()
+            logger.debug("[TIMING] Total transcribe() wall-clock: %.0f ms",
+                         (t_total_end - t_total_start) * 1000)
+
             return result
 
         finally:

@@ -1,4 +1,4 @@
-﻿import os
+import os
 from typing import List, Optional
 from sentence_transformers import SentenceTransformer
 
@@ -17,6 +17,10 @@ class TextEmbedder:
             print(f"[embedder] Loading model from {self.model_path} (first use)...")
             TextEmbedder._shared_model = SentenceTransformer(self.model_path)
         return TextEmbedder._shared_model
+
+    def preload(self):
+        """Force the model to load into memory immediately."""
+        _ = self.model
 
     def get_embedding(self, text: Optional[str]) -> List[float]:
         if text is None:

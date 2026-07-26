@@ -4,6 +4,7 @@ import { startVoiceSession, submitServiceNumberAudio, submitComplaintAudio, conf
 import VoiceRecorder from './VoiceRecorder';
 import TranscriptPanel from './TranscriptPanel';
 import LiveKitAudioTransport from './LiveKitAudioTransport';
+import useSileroVAD from '../../hooks/useSileroVAD';
 
 const VOICE_API_BASE = 'http://127.0.0.1:8001/api/voice';
 
@@ -14,6 +15,9 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
   });
   const [isProcessing, setIsProcessing] = useState(false);
   const [audioPlaying, setAudioPlaying] = useState(false);
+  // bargingIn: true for the brief window between speech detection and the
+  // new recording starting — prevents duplicate submissions or stale prompts.
+  const [bargingIn, setBargingIn]       = useState(false);
   const [fallbackData, setFallbackData] = useState({ service_no: '' });
 
   const audioPlayerRef  = useRef(new Audio());
@@ -99,10 +103,38 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
     setAudioPlaying(false);
   }, []);
 
-  // REQUIREMENT 4 & 5: Barge-in — user bole toh TTS band
+  // ── Barge-in handler ────────────────────────────────────────────────
+  // Called by useMicVAD the instant speech energy is detected while TTS plays.
+  // Stops audio immediately and arms the recorder for the next utterance.
+  const handleBargeIn = useCallback(() => {
+    if (!audioPlaying) return;          // guard: only act when TTS is active
+    if (bargingIn || isProcessing) return;  // guard: prevent duplicate triggers
+    console.log('[barge-in] Speech detected — interrupting TTS');
+    setBargingIn(true);
+    stopAllAudio();
+    // Short debounce so the recorder doesn't start before audio has fully stopped
+    setTimeout(() => {
+      if (isMounted.current) setBargingIn(false);
+    }, 400);
+  }, [audioPlaying, bargingIn, isProcessing, stopAllAudio]);
+
+  // Stream mic audio to the backend Silero VAD while TTS plays.
+  // The backend fires "speech_started" when it detects voice — that event
+  // triggers handleBargeIn which stops TTS immediately.
+  // The hook tears itself down (and closes the WebSocket) as soon as
+  // audioPlaying becomes false, so there is no idle connection at rest.
+  useSileroVAD({
+    sessionId: session.id,
+    active: audioPlaying && !isProcessing,
+    onSpeechDetected: handleBargeIn,
+    wsBaseUrl: 'ws://127.0.0.1:8001/api/voice',
+  });
+
+  // Legacy: called when VoiceRecorder itself starts recording (still useful
+  // for non-barge-in cases, e.g., the user presses the mic button manually).
   const handleRecordingStart = useCallback(() => {
     if (audioPlayerRef.current && !audioPlayerRef.current.paused) {
-      console.log('Barge-in — stopping TTS');
+      console.log('[recorder-start] Stopping residual TTS audio');
       stopAllAudio();
     }
   }, [stopAllAudio]);
@@ -348,11 +380,18 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
         )}
       </div>
 
-      {/* Audio playing indicator */}
+      {/* Audio playing indicator with barge-in hint */}
       {audioPlaying && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(30,144,255,0.06)', border: '1px solid rgba(30,144,255,0.15)', borderRadius: 8, padding: '8px 14px', marginBottom: 12, fontSize: '0.82rem', color: '#1E90FF' }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#1E90FF', animation: 'pulse 1s infinite' }}></div>
-          Speaking... (say something to interrupt)
+          Speaking... (speak to interrupt)
+        </div>
+      )}
+      {/* Barge-in flash indicator */}
+      {bargingIn && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: 'rgba(250,204,21,0.08)', border: '1px solid rgba(250,204,21,0.3)', borderRadius: 8, padding: '8px 14px', marginBottom: 12, fontSize: '0.82rem', color: '#facc15' }}>
+          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#facc15', animation: 'pulse 0.5s infinite' }}></div>
+          Barge-in detected — listening...
         </div>
       )}
 
