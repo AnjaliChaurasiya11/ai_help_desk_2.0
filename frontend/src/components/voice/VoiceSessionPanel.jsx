@@ -212,7 +212,30 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
         if (!isMounted.current) return;
         setSession(prev => ({ ...prev, state: res.data.state, transcript: res.data.transcript, confidence: res.data.confidence, language: res.data.stt_language, latency: res.data.stt_processing_time_ms, promptText: res.data.prompt_text }));
         if (res.data.state === 'OPERATOR_REVIEW') {
-          onClassificationComplete({ intake_id: res.data.intake_id, is_repeat_caller: false, potential_duplicates: [], fault_type_proposal: res.data.fault_type_proposal, severity_proposal: res.data.severity_proposal, candidates: res.data.candidates }, { raw_text: res.data.transcript, complainant_service_no: session.serviceNumber, complainant_name: '', complainant_unit: '', complainant_rank: '', voice_session_id: session.id });
+          onClassificationComplete(
+            {
+              intake_id: res.data.intake_id,
+              is_repeat_caller: false,
+              potential_duplicates: [],
+              fault_type_proposal: res.data.fault_type_proposal,
+              severity_proposal: res.data.severity_proposal,
+              candidates: res.data.candidates,
+              // AI Reasoning layer fields
+              ai_summary: res.data.summary,
+              ai_confidence: res.data.confidence ?? 0,
+              ai_suggested_resolution: res.data.suggested_resolution,
+              needs_followup: res.data.needs_followup ?? false,
+              followup_question: res.data.followup_question ?? null,
+            },
+            {
+              raw_text: res.data.transcript,
+              complainant_service_no: session.serviceNumber,
+              complainant_name: '',
+              complainant_unit: '',
+              complainant_rank: '',
+              voice_session_id: session.id,
+            }
+          );
         } else if (res.data.state === 'CAPTURING_COMPLAINT') {
           await playAudio(`http://127.0.0.1:8001/api/voice/tts?text=${encodeURIComponent(res.data.prompt_text)}`);
         }

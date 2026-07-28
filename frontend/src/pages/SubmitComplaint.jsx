@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { submitIntake } from '../api/tickets.api';
+import { submitIntake, clarifyIntake } from '../api/tickets.api';
+import { extractApiError } from '../api/apiErrors';
+
 import LoadingSpinner from '../components/ui/LoadingSpinner';
 import ErrorMessage from '../components/ui/ErrorMessage';
 import VoiceSessionPanel from '../components/voice/VoiceSessionPanel';
@@ -21,6 +23,8 @@ function SubmitComplaint() {
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState(null);
   const [isVoiceMode, setIsVoiceMode] = useState(!!resumeVoiceSession);
+  const [clarificationData, setClarificationData] = useState(null);
+  const [clarificationAnswer, setClarificationAnswer] = useState('');
 
   function handleChange(e) {
     setForm(prev => ({ ...prev, [e.target.name]: e.target.value }));
@@ -48,13 +52,34 @@ async function handleSubmit() {
     };
     const res = await submitIntake(payload);
 
+    if (res.data.status === 'unable_to_identify') {
+      setClarificationData({ status: 'unable_to_identify' });
+      return;
+    }
+
+    if (res.data.status === 'pending_clarification' || res.data.needs_followup) {
+      setClarificationData({
+        intake_id: res.data.intake_id,
+        question: res.data.followup_question,
+        attempts: res.data.clarification_attempts,
+        originalForm: payload
+      });
+      return;
+    }
+
     if (res.data.corrected_text) {
       payload.raw_text = res.data.corrected_text;
     }
 
-    navigate('/classify', { state: { intakeResponse: res.data, originalForm: payload } });
+    const mappedResponse = {
+      ...res.data,
+      ai_confidence: res.data.confidence,
+      ai_suggested_resolution: res.data.suggested_resolution,
+    };
+
+    navigate('/classify', { state: { intakeResponse: mappedResponse, originalForm: payload } });
   } catch (e) {
-    setError(e.response?.data?.detail || e.message || 'Intake failed');
+    setError(extractApiError(e, 'Intake failed'));
   } finally {
     setLoading(false);
   }
@@ -62,6 +87,50 @@ async function handleSubmit() {
 
   function handleVoiceClassificationComplete(intakeResponse, voiceForm, ttsUrl) {
     navigate('/classify', { state: { intakeResponse, originalForm: voiceForm, ttsUrl } });
+  }
+
+  async function handleClarificationSubmit() {
+    if (!clarificationAnswer.trim()) {
+      setError('Please provide an answer.');
+      return;
+    }
+    setLoading(true); setError(null);
+    try {
+      const res = await clarifyIntake(clarificationData.intake_id, {
+        clarification_text: clarificationAnswer.trim()
+      });
+      
+      if (res.data.status === 'unable_to_identify') {
+        setClarificationData({ status: 'unable_to_identify' });
+        return;
+      }
+      
+      if (res.data.status === 'pending_clarification' || res.data.needs_followup) {
+        setClarificationData({
+          ...clarificationData,
+          question: res.data.followup_question,
+          attempts: res.data.clarification_attempts
+        });
+        setClarificationAnswer('');
+        return;
+      }
+
+      if (res.data.corrected_text) {
+        clarificationData.originalForm.raw_text = res.data.corrected_text;
+      }
+
+      const mappedResponse = {
+        ...res.data,
+        ai_confidence: res.data.confidence,
+        ai_suggested_resolution: res.data.suggested_resolution,
+      };
+
+      navigate('/classify', { state: { intakeResponse: mappedResponse, originalForm: clarificationData.originalForm } });
+    } catch (e) {
+      setError(extractApiError(e, 'Clarification failed'));
+    } finally {
+      setLoading(false);
+    }
   }
 
   if (loading) return <LoadingSpinner text="AI classification chal rahi hai..." />;
@@ -98,6 +167,59 @@ async function handleSubmit() {
           resumePromptText={resumeVoiceSession?.promptText}
           lastTicketNumber={resumeVoiceSession?.lastTicketNumber}
         />
+      ) : clarificationData ? (
+        <div style={card}>
+          {clarificationData.status === 'unable_to_identify' ? (
+            <>
+              <div style={cardTitle}>Unable to Identify</div>
+              <p style={{ fontSize: '14px', color: 'var(--text-primary)', marginBottom: '16px' }}>
+                This complaint could not be identified after multiple attempts. No ticket was created.
+              </p>
+              <button 
+                onClick={() => {
+                  setClarificationData(null);
+                  setClarificationAnswer('');
+                  setForm({ ...form, raw_text: '' });
+                }}
+                style={{ background: 'var(--surface-2)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: '8px', padding: '10px 24px', fontSize: '14px', fontWeight: 500, cursor: 'pointer' }}
+              >
+                Start Over
+              </button>
+            </>
+          ) : (
+            <>
+              <div style={cardTitle}>Clarification Required</div>
+              <div style={{ padding: '12px', background: 'rgba(255, 171, 0, 0.1)', borderLeft: '4px solid #FFAB00', marginBottom: '16px', borderRadius: '4px', fontSize: '14px', color: 'var(--text-primary)' }}>
+                <strong style={{ display: 'block', marginBottom: '8px' }}>Follow-up Question:</strong>
+                {clarificationData.question}
+              </div>
+              <textarea 
+                value={clarificationAnswer} 
+                onChange={(e) => setClarificationAnswer(e.target.value)}
+                placeholder="Type your answer here..."
+                rows={4} 
+                style={{ ...inputStyle, resize: 'vertical', lineHeight: '1.6', marginBottom: '16px' }} 
+              />
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                  Attempt {clarificationData.attempts} of 3
+                </span>
+                <button 
+                  onClick={handleClarificationSubmit}
+                  disabled={!clarificationAnswer.trim()}
+                  style={{
+                    background: 'var(--accent)', color: '#fff', border: 'none',
+                    borderRadius: '8px', padding: '10px 24px',
+                    fontSize: '14px', fontWeight: 500, cursor: 'pointer',
+                    opacity: !clarificationAnswer.trim() ? 0.5 : 1,
+                  }}
+                >
+                  Submit Answer →
+                </button>
+              </div>
+            </>
+          )}
+        </div>
       ) : (
         <>
           <div style={card}>

@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { confirmTicket, confirmMultiTicket, submitIntake } from '../api/tickets.api';
+import { extractApiError } from '../api/apiErrors';
+
 import { fetchAudioBlob } from '../api/voice.api';
 import { FAULT_TYPES, SEVERITY_LEVELS, SEVERITY_COLOR } from '../constants/enums';
 import ErrorMessage from '../components/ui/ErrorMessage';
@@ -97,7 +99,13 @@ function ClassifyReview() {
   if (!state?.intakeResponse) { navigate('/submit'); return null; }
 
   const { intakeResponse, originalForm, ttsUrl } = state;
-  const { candidates, fault_type_proposal, severity_proposal, is_repeat_caller, potential_duplicates, intake_id } = intakeResponse;
+  const {
+    candidates, fault_type_proposal, severity_proposal,
+    is_repeat_caller, potential_duplicates, intake_id,
+    // AI Reasoning layer (populated when ENABLE_AI_REASONING=True)
+    ai_confidence = 0, ai_suggested_resolution,
+    needs_followup = false, followup_question = null,
+  } = intakeResponse;
 
   const originalComplaintRef = useRef(originalForm.raw_text);
   const [editedComplaint, setEditedComplaint] = useState(originalForm.raw_text);
@@ -139,8 +147,17 @@ function ClassifyReview() {
   const sameUserDupes = activeDupes.filter(d => d.is_same_user);
   const diffUserDupes = activeDupes.filter(d => !d.is_same_user);
 
-  const defaultTicket = (cands, faultType, severity) => ({
-    selectedAppId: (cands ?? activeCandidates).find(c => c.is_primary)?.application_id ?? (cands ?? activeCandidates)[0]?.application_id ?? null,
+  // When confidence is below threshold the LLM is not sure which app
+  // is affected.  Start with no app selected so the operator makes a
+  // conscious choice rather than confirming a wrong auto-selection.
+  const activeNeedsFollowup = reanalysisResult
+    ? (reanalysisResult.needs_followup ?? false)
+    : needs_followup;
+
+  const defaultTicket = (cands, faultType, severity, forceUnselected = false) => ({
+    selectedAppId: forceUnselected
+      ? null
+      : ((cands ?? activeCandidates).find(c => c.is_primary)?.application_id ?? (cands ?? activeCandidates)[0]?.application_id ?? null),
     relatedAppIds: (cands ?? activeCandidates).filter(c => !c.is_primary).map(c => c.application_id),
     faultType: faultType ?? activeFaultTypeProposal,
     severity: severity ?? activeSeverityProposal,
@@ -148,7 +165,7 @@ function ClassifyReview() {
     noMatch: false,
   });
 
-  const [tickets,  setTickets]  = useState([defaultTicket()]);
+  const [tickets,  setTickets]  = useState([defaultTicket(undefined, undefined, undefined, needs_followup)]);
   const [loading,  setLoading]  = useState(false);
   const [error,    setError]    = useState(null);
 
@@ -167,9 +184,10 @@ function ClassifyReview() {
       const freshData = res.data;
       setReanalysisResult(freshData);
       // Reset tickets with the new proposals
-      setTickets([defaultTicket(freshData.candidates, freshData.fault_type_proposal, freshData.severity_proposal)]);
+      const followupOnReanalysis = freshData.needs_followup ?? false;
+      setTickets([defaultTicket(freshData.candidates, freshData.fault_type_proposal, freshData.severity_proposal, followupOnReanalysis)]);
     } catch (e) {
-      setError(e.response?.data?.detail || e.message || 'Reanalysis failed');
+      setError(extractApiError(e, 'Reanalysis failed'));
     } finally {
       setReanalyzing(false);
     }
@@ -256,6 +274,12 @@ function ClassifyReview() {
 
   if (loading) return <LoadingSpinner text="Ticket(s) create ho rahe hain..." />;
 
+  // Active reasoning values (prefer reanalysis if available)
+  const activeNeedsFollowupVal = reanalysisResult ? (reanalysisResult.needs_followup ?? false) : needs_followup;
+  const activeFollowupQuestion = reanalysisResult ? (reanalysisResult.followup_question ?? null) : followup_question;
+  const activeAiResolution     = reanalysisResult ? (reanalysisResult.ai_suggested_resolution ?? null) : ai_suggested_resolution;
+  const activeAiConfidence     = reanalysisResult ? (reanalysisResult.ai_confidence ?? 0)           : ai_confidence;
+
   return (
     <div style={{ maxWidth: '720px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
 
@@ -282,6 +306,37 @@ function ClassifyReview() {
       )}
 
       {error && <ErrorMessage message={error} />}
+
+      {/* AI Follow-up Banner — shown when confidence is below threshold */}
+      {activeNeedsFollowupVal && activeFollowupQuestion && (
+        <div style={{
+          background: 'rgba(245,158,11,0.08)', border: '1.5px solid var(--warning)',
+          borderRadius: '10px', padding: '14px 18px',
+          animation: 'fadeIn 0.3s ease-out',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+            <span style={{ fontSize: '16px' }}>🤔</span>
+            <span style={{ fontWeight: 700, fontSize: '13px', color: 'var(--warning)' }}>I need clarification (confidence: {Math.round(activeAiConfidence * 100)}%)</span>
+          </div>
+          <div style={{ fontSize: '13px', color: 'var(--text-primary)', lineHeight: '1.6', marginBottom: '10px' }}>
+            {activeFollowupQuestion}
+          </div>
+          <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+            ℹ️ No application is pre-selected below. Please clarify with the caller and select the correct application before confirming.
+          </div>
+        </div>
+      )}
+
+      {/* AI Suggested Resolution card (shown when available) */}
+      {activeAiResolution && !activeNeedsFollowupVal && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '12px' }}>
+          <div style={{ background: 'rgba(16,185,129,0.06)', border: '1px solid rgba(16,185,129,0.25)', borderRadius: '10px', padding: '12px 14px' }}>
+            <div style={{ fontSize: '11px', fontWeight: 700, color: '#10b981', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Suggested Resolution</div>
+            <div style={{ fontSize: '12.5px', color: 'var(--text-primary)', lineHeight: '1.55' }}>{activeAiResolution}</div>
+          </div>
+        </div>
+      )}
+
 
       <div style={card}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
@@ -389,5 +444,13 @@ const cardTitle = { fontWeight: 500, fontSize: '13px', marginBottom: '10px', col
 const selectStyle = { width: '100%', padding: '9px 12px', fontSize: '13px', border: '1px solid var(--border)', borderRadius: '8px', outline: 'none', fontFamily: 'inherit', color: 'var(--text-primary)', background: 'var(--surface-2)' };
 const primaryBtn = { background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: '8px', padding: '10px 24px', fontSize: '14px', fontWeight: 500, cursor: 'pointer', flex: 1 };
 const secondaryBtn = { background: 'transparent', color: 'var(--accent)', border: '1px solid var(--accent)', borderRadius: '8px', padding: '10px 20px', fontSize: '14px', cursor: 'pointer' };
+
+// Inject fadeIn keyframe once (used by the follow-up confidence banner)
+if (typeof document !== 'undefined' && !document.getElementById('cr-fadein-style')) {
+  const s = document.createElement('style');
+  s.id = 'cr-fadein-style';
+  s.textContent = '@keyframes fadeIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }';
+  document.head.appendChild(s);
+}
 
 export default ClassifyReview;

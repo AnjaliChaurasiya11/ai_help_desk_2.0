@@ -47,7 +47,9 @@ function VoiceRecorder({ onRecordingComplete, onRecordingStart, isProcessing = f
         if (!isRecordingRef.current) return;
         analyser.getByteFrequencyData(data);
         const avg = data.reduce((a, b) => a + b, 0) / data.length;
-        if (avg > 5) {
+        // Increased threshold from 5 to 15 to avoid background noise triggering speech endlessly,
+        // which caused massive audio blobs and STT latency spikes.
+        if (avg > 15) {
           hasSpokeRef.current = true;
           setStatus("Speaking detected...");
           clearTimeout(silenceTimerRef.current);
@@ -55,7 +57,7 @@ function VoiceRecorder({ onRecordingComplete, onRecordingStart, isProcessing = f
         } else if (hasSpokeRef.current) {
           setStatus("Will auto-stop after silence...");
           if (!silenceTimerRef.current) {
-            silenceTimerRef.current = setTimeout(() => { stopRecording(); }, 2500);
+            silenceTimerRef.current = setTimeout(() => { stopRecording(); }, 2000);
           }
         } else {
           setStatus("Listening for speech...");

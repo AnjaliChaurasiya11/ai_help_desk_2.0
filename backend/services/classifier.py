@@ -192,7 +192,7 @@ class TicketClassifier:
         if not text_content or not text_content.strip():
             default_reasoning = {
                 "fault_type": "other", "severity": "normal",
-                "confidence": 1.0, "summary": "",
+                "confidence": 1.0,
                 "suggested_resolution": "", "needs_followup": False,
                 "followup_question": None,
             }
@@ -213,7 +213,6 @@ class TicketClassifier:
                 "fault_type": fault_from_history,
                 "severity": severity_from_history,
                 "confidence": 1.0,
-                "summary": "",
                 "suggested_resolution": "",
                 "needs_followup": False,
                 "followup_question": None,

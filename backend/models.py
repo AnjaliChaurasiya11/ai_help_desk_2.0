@@ -83,6 +83,14 @@ class Intake(SQLModel, table=True):
     complainant_name       : Optional[str] = Field(default=None, max_length=100)
     complainant_unit       : Optional[str] = Field(default=None, max_length=100)
     complainant_rank       : Optional[str] = Field(default=None, max_length=50)
+    clarification_attempts : int = Field(default=0)
+    # "complete" | "pending_clarification" | "unable_to_identify"
+    # Run this migration once against your existing DB:
+    #   ALTER TABLE intakes ADD COLUMN IF NOT EXISTS status VARCHAR(30) DEFAULT 'complete';
+    #   ALTER TABLE intakes ADD COLUMN IF NOT EXISTS clarification_attempts INTEGER DEFAULT 0;
+    #   ALTER TABLE intakes ADD COLUMN IF NOT EXISTS last_followup_question TEXT;
+    status                 : Optional[str] = Field(default="complete", max_length=30)
+    last_followup_question : Optional[str] = Field(default=None)
 
 # TABLE 6: tickets
 class UserRole(SQLModel, table=True):

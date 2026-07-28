@@ -913,12 +913,11 @@ class LiveKitAdapter:
             if result_data.status == "rejected":
                 return result_data.prompt_text
 
-            # The shared pipeline automatically transitions the session state to OPERATOR_REVIEW.
-            # We just need to broadcast the state_change for the LiveKit-specific frontend adapter,
-            # though the shared pipeline also does WebSocket broadcasts. We'll do it here to ensure
-            # any adapter-specific UI components (like the old LiveKit adapter state) are updated.
+            # Broadcast the new state to the LiveKit-specific frontend adapter.
+            # This ensures any adapter-specific UI components are updated.
+            current_session = self._session_manager.get_session(session_id)
             await self._notify(session_id, "state_change", {
-                "state": SessionState.OPERATOR_REVIEW.value,
+                "state": current_session.state.value if current_session else SessionState.OPERATOR_REVIEW.value,
                 "transcript": result_data.corrected_transcript,
                 "prompt_text": result_data.prompt_text,
                 "fault_type_proposal": result_data.fault_type,

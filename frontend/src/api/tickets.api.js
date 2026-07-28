@@ -1,6 +1,7 @@
 import api from './axios';
 
 export const submitIntake = (data) => api.post('/api/intakes', data);
+export const clarifyIntake = (intakeId, data) => api.post(`/api/intakes/${intakeId}/clarify`, data);
 export const confirmTicket = (data) => api.post('/api/tickets/confirm', data);
 export const confirmMultiTicket = (data) => api.post('/api/tickets/confirm-multi', data);
 export const listTickets = (params = {}) => api.get('/api/tickets', { params });

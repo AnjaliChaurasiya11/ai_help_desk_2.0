@@ -213,6 +213,80 @@ def verify_and_correct_text(raw_text: str) -> dict:
 
 
 # ===========================================================================
+# PUBLIC FUNCTION 1.5: analyze_complaint_category
+# ===========================================================================
+
+_CATEGORY_SYSTEM_PROMPT = """You are an expert IT support engineer and dispatcher for an Enterprise Help Desk.
+Your FIRST responsibility is to determine whether the incoming complaint contains enough information to proceed.
+Do NOT attempt to identify the application yet. Focus ONLY on completeness.
+
+Every complaint falls into one of three categories:
+1. "complete" — The complaint contains enough information to identify the application/system and understand the issue. Short complaints are NOT automatically incomplete. If the complaint clearly identifies the affected application and describes a recognizable issue (e.g., "login nahi ho raha HRMS me"), classify it as complete.
+2. "incomplete" — The complaint is genuine, but you cannot confidently determine the affected application or the exact issue. You must ask ONE targeted clarification question.
+3. "invalid" — The complaint is meaningless, random words, or not related to IT (e.g., "hello", "okay", "thanks").
+
+Rules for "incomplete" complaints:
+- Ask exactly ONE targeted clarification question.
+- The question must be specific, concise, and ask ONLY for the single most important missing piece of information.
+- Avoid asking multiple unrelated questions in one response.
+
+You MUST respond with ONLY a valid JSON object in this exact format:
+{"category": "complete" | "incomplete" | "invalid", "followup_question": "<question or null>", "followup_reason": "<brief reason or null>"}
+
+EXAMPLES:
+"I cannot log in to the Medical Records System." -> {"category": "complete", "followup_question": null, "followup_reason": null}
+"Travel claim rejected without any reason." -> {"category": "complete", "followup_question": null, "followup_reason": null}
+"Sir system kaam nahi kar raha" -> {"category": "incomplete", "followup_question": "Which application or system are you referring to?", "followup_reason": "missing_application"}
+"I am getting some error message" -> {"category": "incomplete", "followup_question": "Which application are you using, and what does the error message say?", "followup_reason": "missing_application_and_issue"}
+"hello" -> {"category": "invalid", "followup_question": "Please describe your IT issue.", "followup_reason": "not_an_it_complaint"}
+"""
+
+def analyze_complaint_category(raw_text: str, previous_question: Optional[str] = None) -> dict:
+    if settings.MOCK_LLM:
+        logger.info("[LLM MOCK] analyze_complaint_category called.")
+        text_lower = raw_text.lower().strip()
+        if text_lower in ["hello", "hi", "okay", "thanks", "yes", "no"]:
+            return {"category": "invalid", "followup_question": "Please describe your IT issue.", "followup_reason": "not_an_it_complaint"}
+        if len(text_lower.split()) < 4 and not any(app in text_lower for app in ["hrms", "sap", "portal", "system"]):
+            if previous_question:
+                return {"category": "incomplete", "followup_question": "What were you trying to do when the problem occurred, and which screen or portal were you using?", "followup_reason": "missing_application"}
+            return {"category": "incomplete", "followup_question": "Which application or system are you referring to?", "followup_reason": "missing_application"}
+        return {"category": "complete", "followup_question": None, "followup_reason": None}
+
+    logger.info("[LLM] Calling vLLM to analyze complaint category.")
+    try:
+        if previous_question:
+            # Build a context-aware user prompt that includes the prior question
+            # so the LLM knows what has already been asked and must ask differently
+            user_prompt = (
+                f"COMPLAINT TEXT (includes previous clarification merged in):\n{raw_text}\n\n"
+                f"PREVIOUS CLARIFICATION QUESTION THAT WAS ALREADY ASKED:\n{previous_question}\n\n"
+                f"INSTRUCTION: If you determine the complaint is still incomplete, you MUST ask a "
+                f"DIFFERENT clarification question from a completely different angle. "
+                f"Do NOT repeat or rephrase the previous question. "
+                f"Instead, try asking about: what screen they were on, what they were trying to do, "
+                f"what error message appeared, or which specific function they were using."
+            )
+        else:
+            user_prompt = raw_text
+
+        raw_response = _call_llm(_CATEGORY_SYSTEM_PROMPT, user_prompt, stage_name="Complaint Category LLM")
+        result = json.loads(raw_response)
+
+        category = result.get("category", "complete")
+        if category not in ["complete", "incomplete", "invalid"]:
+            category = "complete"
+
+        return {
+            "category": category,
+            "followup_question": result.get("followup_question"),
+            "followup_reason": result.get("followup_reason")
+        }
+    except Exception as e:
+        logger.error("[LLM] Unexpected error analyzing complaint category: %s", e)
+        return {"category": "complete", "followup_question": None, "followup_reason": None}
+
+# ===========================================================================
 # PUBLIC FUNCTION 2: predict_fault_and_severity
 # ===========================================================================
 
@@ -402,55 +476,90 @@ def predict_fault_and_severity(complaint_text: str) -> dict:
         return {"fault_type": "other", "severity": "normal"}
     except Exception as e:
         logger.error("[LLM] Unexpected error calling vLLM for classification: %s", e)
-        return {\"fault_type\": \"other\", \"severity\": \"normal\"}
+        return {"fault_type": "other", "severity": "normal"}
 
 
 # ===========================================================================
 # PUBLIC FUNCTION 3: classify_and_reason (context-aware single LLM call)
 # ===========================================================================
 
-_CLASSIFY_AND_REASON_SYSTEM_PROMPT = """You are an expert IT support dispatcher for an Enterprise Help Desk.
+_CLASSIFY_AND_REASON_SYSTEM_PROMPT = """You are an expert IT support engineer and dispatcher for an Enterprise Help Desk.
 
-You will receive a complaint and retrieved context (matching applications, their known symptoms and purposes, and similar past tickets). Use ALL of this information to produce a single structured analysis.
+Your job is to classify incoming IT complaints with precision and intellectual honesty.
+Treat retrieved applications as hypotheses generated by semantic search, not as confirmed answers. Retrieval provides evidence, not proof. A highly ranked candidate should increase your confidence only when the complaint itself supports that conclusion.
 
-VALID FAULT TYPES (choose exactly one):
-"login/access", "performance/slow", "data error", "total outage", "partial/degraded", "other"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO USE RETRIEVED APPLICATION CANDIDATES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The CANDIDATE HYPOTHESES section lists applications retrieved by SEMANTIC SIMILARITY to the complaint.
+They are HYPOTHESES, not answers. Treat them as suggestions to evaluate, not as confirmation.
 
-FAULT TYPE DEFINITIONS:
-- "login/access": Cannot log in, password issues, account locked, OTP not working, SSO failure, access denied.
-- "performance/slow": Application is slow, lagging, timing out, hanging, loading forever.
-- "data error": Wrong data displayed, incorrect figures, salary mismatch, record not found, data corruption.
-- "total outage": Application completely down, server unreachable, 404/500 errors, no one can access.
-- "partial/degraded": Some features work but others are broken, partial functionality, specific page/button not working.
-- "other": Does not clearly fit into any of the above categories.
+CRITICAL: A high retrieval score does NOT mean the application is correct.
+Semantic search finds applications that share vocabulary with the complaint — but a vague complaint
+like "nothing loads" matches many applications. A high-scoring candidate should only increase your
+confidence if the complaint text itself provides corroborating detail (e.g., the user named the
+application, described a specific action, or mentioned a feature unique to that application).
 
-VALID SEVERITIES (choose exactly one):
-"critical", "high", "normal", "low"
+Do NOT let retrieved candidates substitute for a clear complaint.
+If the complaint is vague, it remains vague even if retrieval returns a high-confidence match.
 
-SEVERITY DEFINITIONS:
-- "critical": Entire base or mission-critical systems are down, many users affected.
-- "high": An important workflow is broken for multiple users or a team.
-- "normal": A single user has a routine issue. DEFAULT when unclear.
-- "low": Minor cosmetic or non-blocking issue.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VALID FAULT TYPES (choose exactly one)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"login/access"     — Cannot log in, password issues, account locked, OTP not working, SSO failure, access denied.
+"performance/slow" — Application is slow, lagging, timing out, hanging, loading forever.
+"data error"       — Wrong data displayed, incorrect figures, salary mismatch, record not found, data corruption.
+"total outage"     — Application completely down, server unreachable, 404/500 errors, no one can access.
+"partial/degraded" — Some features work, others broken; specific page or button not working.
+"other"            — Does not clearly fit into any of the above categories.
 
-FIELD DEFINITIONS:
-- summary: A concise 1-2 sentence human-readable description of the issue. Write in third person (e.g., "User cannot log in to the AFMS portal — likely an SSO failure.").
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VALID SEVERITIES (choose exactly one)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"critical" — Entire base or mission-critical systems are down; many users affected.
+"high"     — An important workflow is broken for multiple users or a team.
+"normal"   — A single user has a routine issue. DEFAULT when unclear.
+"low"      — Minor cosmetic or non-blocking issue.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FIELD DEFINITIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - fault_type: One of the valid fault types above.
-- severity: One of the valid severities above.
-- confidence: Float 0.0-1.0 reflecting how certain you are about fault_type+severity given the complaint and context. Be conservative — use 0.5 if genuinely uncertain.
-- suggested_resolution: A concrete first-response action (1-2 sentences) drawn from the retrieved context. If no relevant context is available, write a standard triage suggestion.
-- needs_followup: Boolean. True ONLY if the complaint is genuinely ambiguous and a specific clarifying question would materially improve classification. False in all other cases.
-- followup_question: If needs_followup is true, a short, specific question to ask the caller. null otherwise.
 
-RULES:
-- Use retrieved application context heavily — it is specifically selected for this complaint.
-- If the complaint is in Hindi or Hinglish, still classify correctly.
-- Default severity to "normal" if uncertain.
-- Default fault_type to "other" if uncertain.
-- Keep summary and suggested_resolution concise and actionable.
+- severity: One of the valid severities above. Default to \"normal\" when unclear.
 
-RESPONSE FORMAT — ONLY a valid JSON object, no markdown, no explanation:
-{"summary": "...", "fault_type": "...", "severity": "...", "confidence": 0.0, "suggested_resolution": "...", "needs_followup": false, "followup_question": null}"""
+- confidence:
+  A float 0.0–1.0 representing how certain you are of your fault_type and severity classification.
+  Base confidence on the COMPLAINT TEXT, not on retrieval scores.
+  Be conservative. Use 0.4–0.55 for genuinely vague complaints.
+  Use 0.7–0.9 only when the complaint is specific and candidates strongly corroborate it.
+
+- suggested_resolution:
+  A concrete first-response action drawn from candidate symptoms and purposes.
+  If the complaint is too vague to suggest a specific action, suggest asking for more detail first.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FEW-SHOT EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+--- CLEAR COMPLAINT ---
+Complaint: "I cannot log into the AFMS portal, my password is locked."
+Result: {"fault_type": "login/access", "severity": "normal", "confidence": 0.92, "suggested_resolution": "Reset the user account password via the SSO admin console and verify OTP delivery."}
+
+--- HINGLISH ---
+Complaint: "Login nahi ho raha mujhe AFMS portal mein, password lock ho gaya."
+Result: {"fault_type": "login/access", "severity": "normal", "confidence": 0.89, "suggested_resolution": "Reset account credentials via the SSO admin panel and verify OTP is being sent to the correct number."}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FINAL RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Never inflate confidence because a candidate was retrieved — retrieval is a hint, not a fact.
+- If the complaint is in Hindi or Hinglish, apply the same standards.
+- Keep suggested_resolution short and actionable.
+
+RESPONSE FORMAT — output ONLY a valid JSON object. No markdown, no explanation, no extra text:
+{"fault_type": "...", "severity": "...", "confidence": 0.0, "suggested_resolution": "..."}"""
+
 
 
 def _build_reasoning_user_prompt(
@@ -459,28 +568,65 @@ def _build_reasoning_user_prompt(
     symptoms: dict,
     purposes: dict,
 ) -> str:
-    """Assemble the user-turn message injecting retrieved context compactly."""
-    lines = [f"COMPLAINT:\n{complaint_text}\n"]
+    """Assemble the user-turn message injecting retrieved context compactly.
+
+    The section header is deliberately labelled CANDIDATE HYPOTHESES to reinforce
+    the system-prompt framing: retrieved applications are possibilities to evaluate,
+    not authoritative answers. The retrieval score is preserved so the LLM can see
+    how confident the search engine was, but the system prompt instructs it not to
+    let that score substitute for clarity in the complaint text itself.
+
+    Additionally, if the complaint text explicitly names one of the candidate
+    applications, that fact is surfaced as a high-priority note so the LLM ties
+    the suggested_resolution to the correct application.
+    """
+    word_count = len(complaint_text.split())
+    text_lower = complaint_text.lower()
+
+    lines = [
+        f"COMPLAINT:\n{complaint_text}",
+        f"(complaint word count: {word_count})",
+        "",
+    ]
+
+    # ── Explicit name detection ───────────────────────────────────────────────
+    explicitly_named = [
+        app for app in candidate_apps
+        if app.get("application_name", "").lower() in text_lower
+    ]
+    if explicitly_named:
+        named_app = explicitly_named[0].get("application_name", "")
+        lines.append(
+            f"⚠ EXPLICIT APPLICATION MENTION DETECTED: The complaint text directly names "
+            f"'{named_app}'. Your suggested_resolution MUST be specific to this application. "
+            f"Do NOT generate a generic resolution."
+        )
+        lines.append("")
 
     if candidate_apps:
-        lines.append("RETRIEVED APPLICATIONS (ranked by semantic similarity):")
+        lines.append(
+            "CANDIDATE HYPOTHESES — applications retrieved by semantic similarity."
+        )
+        lines.append(
+            "Evaluate each against the complaint. Do not assume the top result is correct."
+        )
         for i, app in enumerate(candidate_apps[:3], 1):
             name = app.get("application_name", app.get("name", "Unknown"))
             score = app.get("confidence_score", 0.0)
             app_id = app.get("application_id")
-            line = f"  {i}. {name} (confidence: {score:.2f})"
+            line = f"  {i}. {name} (retrieval score: {score:.2f})"
 
             syms = symptoms.get(app_id, [])
             if syms:
-                line += f"\n     Symptoms: {'; '.join(syms[:3])}"
+                line += f"\n     Known symptoms: {'; '.join(syms[:3])}"
 
             purps = purposes.get(app_id, [])
             if purps:
-                line += f"\n     Purpose: {purps[0]}"
+                line += f"\n     Application purpose: {purps[0]}"
 
             lines.append(line)
     else:
-        lines.append("RETRIEVED APPLICATIONS: None found.")
+        lines.append("CANDIDATE HYPOTHESES: None found. Classify based on complaint text alone.")
 
     return "\n".join(lines)
 
@@ -502,17 +648,13 @@ def classify_and_reason(
         purposes:        Dict {app_id: [purpose_text, ...]} for the top candidates.
 
     Returns a dict with keys:
-        fault_type, severity, confidence, summary,
-        suggested_resolution, needs_followup, followup_question
+        fault_type, severity, confidence, suggested_resolution
     """
     _FALLBACK = {
         "fault_type": "other",
         "severity": "normal",
         "confidence": 0.5,
-        "summary": "",
         "suggested_resolution": "",
-        "needs_followup": False,
-        "followup_question": None,
     }
 
     # ── MOCK MODE ────────────────────────────────────────────────────────────
@@ -528,10 +670,7 @@ def classify_and_reason(
             "fault_type": base["fault_type"],
             "severity": base["severity"],
             "confidence": confidence,
-            "summary": f"[MOCK] User reported a {base['fault_type']} issue with {primary_app}.",
             "suggested_resolution": f"[MOCK] Escalate to the {primary_app} support team and verify system status.",
-            "needs_followup": confidence < 0.65,
-            "followup_question": "Could you clarify which specific feature or system is affected?" if confidence < 0.65 else None,
         }
 
     # ── PRODUCTION MODE ──────────────────────────────────────────────────────
@@ -562,17 +701,11 @@ def classify_and_reason(
         except (TypeError, ValueError):
             confidence = 0.5
 
-        needs_followup = bool(result.get("needs_followup", False))
-        followup_question = result.get("followup_question") if needs_followup else None
-
         return {
             "fault_type": fault_type,
             "severity": severity,
             "confidence": confidence,
-            "summary": str(result.get("summary", "")),
             "suggested_resolution": str(result.get("suggested_resolution", "")),
-            "needs_followup": needs_followup,
-            "followup_question": followup_question,
         }
 
     except (json.JSONDecodeError, ValueError, KeyError) as e:

@@ -32,6 +32,7 @@ from models import (
 from schemas import (
     IntakeRequest,
     IntakeResponse,
+    ClarifyRequest,
     CandidateApp,
     DuplicateInfo,
     TicketConfirmRequest,
@@ -53,8 +54,7 @@ from schemas import (
 
 from services.embedder import TextEmbedder
 from services.dependencies import ApplicationDependencyEngine
-from services.llm_client import verify_and_correct_text
-from services.pipeline import run_ai_pipeline
+from services.pipeline import process_complaint
 
 import logging
 from voice.session import session_manager
@@ -132,70 +132,142 @@ def create_intake(
 ):
     """
     Step 1 of the ticket creation flow.
-    Accepts raw complaint text, runs AI classification, and returns
-    proposals for the operator to review before confirming.
-    """
 
-    # -----------------------------------------------------------------
-    # 1a. LLM GUARDRAIL — Verify language + fix STT errors
-    # -----------------------------------------------------------------
-    guardrail_result = verify_and_correct_text(request.raw_text)
-    if guardrail_result["status"] == "rejected":
+    Thin adapter over services.pipeline.process_complaint().
+    Accepts the raw complaint text, runs the shared AI pipeline,
+    and returns a proposal for the operator to review.
+
+    The pipeline owns guardrail validation, heuristic evaluation,
+    retrieval, LLM classification, and intake persistence.
+    """
+    result = process_complaint(
+        session                = session,
+        complaint_text         = request.raw_text,
+        complainant_service_no = request.complainant_service_no or "",
+        operator_id            = current_user.service_no,
+        complainant_name       = request.complainant_name  or "",
+        complainant_unit       = request.complainant_unit  or "",
+        complainant_rank       = request.complainant_rank  or "",
+    )
+
+    if result.status == "rejected":
         raise HTTPException(
             status_code=400,
-            detail=guardrail_result.get("reason", "Complaint was rejected by the guardrail.")
+            detail=result.state.followup_question or "Complaint was rejected.",
         )
-    # Use the LLM-corrected text for the rest of the pipeline
-    complaint_text = guardrail_result.get("corrected_text", request.raw_text)
 
-    # -----------------------------------------------------------------
-    # 1b. Save the CORRECTED complaint to complaint_intake table
-    # -----------------------------------------------------------------
-    intake = Intake(
-        raw_text=complaint_text,
-        operator_id=current_user.service_no,
-        complainant_service_no=request.complainant_service_no,
-        complainant_name=request.complainant_name,
-        complainant_unit=request.complainant_unit,
-        complainant_rank=request.complainant_rank,
-    )
-    session.add(intake)
-    session.commit()
-    session.refresh(intake)
-
-    # -----------------------------------------------------------------
-    # 1c. AI PIPELINE — classify, search, expand (R-9, R-10, R-20a)
-    # Delegated to services/pipeline.py which is the single source of
-    # truth for this logic, shared with the voice complaint path.
-    # -----------------------------------------------------------------
-    fault_type, severity, enriched_candidates, potential_duplicates, is_repeat = run_ai_pipeline(
-        session=session,
-        complaint_text=complaint_text,
-        complainant_service_no=request.complainant_service_no or "",
-    )
-
-    # -----------------------------------------------------------------
-    # 1d. BUILD THE RESPONSE — Convert pipeline dicts to schema objects
-    # -----------------------------------------------------------------
     candidates: list[CandidateApp] = [
         CandidateApp(
-            application_id=c["application_id"],
-            application_name=c["application_name"],
-            confidence_score=round(c["confidence_score"], 4),
-            is_primary=c.get("is_primary", False),
-            expansion_reason=c.get("expansion_reason"),
+            application_id   = c["application_id"],
+            application_name = c["application_name"],
+            confidence_score = round(c["confidence_score"], 4),
+            is_primary       = c.get("is_primary", False),
+            expansion_reason = c.get("expansion_reason"),
         )
-        for c in enriched_candidates
+        for c in result.candidates
     ]
 
     return IntakeResponse(
-        intake_id=intake.id,
-        corrected_text=complaint_text,
-        is_repeat_caller=is_repeat,
-        potential_duplicates=potential_duplicates,
-        fault_type_proposal=fault_type,
-        severity_proposal=severity,
-        candidates=candidates,
+        intake_id            = result.intake_id,
+        corrected_text       = result.corrected_text,
+        is_repeat_caller     = result.is_repeat_caller,
+        potential_duplicates = result.potential_duplicates,
+        status               = result.status,
+        fault_type_proposal  = result.fault_type or "other",
+        severity_proposal    = result.severity   or "normal",
+        candidates           = candidates,
+        confidence           = result.state.confidence,
+        suggested_resolution = result.state.suggested_resolution,
+        needs_followup       = result.state.needs_followup,
+        followup_question    = result.state.followup_question,
+        followup_reason      = result.state.followup_reason,
+        clarification_attempts = result.clarification_attempts,
+    )
+
+
+# =====================================================================
+# 1b. POST /api/intakes/{intake_id}/clarify — Submit clarification answer
+# =====================================================================
+# Decision 5: dedicated clarification endpoint for structured multi-turn flow.
+# The pipeline merges the answer with the original complaint and re-runs
+# classification from the sufficiency check onward.
+
+@router.post("/intakes/{intake_id}/clarify", response_model=IntakeResponse)
+def clarify_intake(
+    intake_id: int,
+    request: ClarifyRequest,
+    session: Session = Depends(get_session),
+    current_user: CurrentUser = Depends(require_operator),
+):
+    """
+    Step 1b — Submit a clarification answer after a follow-up question.
+
+    Loads the pending_clarification Intake, merges the clarification text
+    with the original complaint, and re-runs process_complaint() to attempt
+    full classification.  The Intake record is updated in-place (same ID).
+    """
+    from models import Intake as IntakeModel
+    from services.conversation_state import ConversationManager, ConversationState
+
+    intake = session.get(IntakeModel, intake_id)
+    if intake is None:
+        raise HTTPException(status_code=404, detail=f"Intake {intake_id} not found.")
+    if intake.status != "pending_clarification":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Intake {intake_id} is not pending clarification (status={intake.status!r}).",
+        )
+
+    # Merge the clarification answer into the original complaint text
+    merged_text = ConversationManager.merge_clarification(
+        original_text  = intake.raw_text,
+        clarification  = request.clarification_text,
+        state          = ConversationState(),  # no prior state needed for merge
+    )
+
+    result = process_complaint(
+        session                = session,
+        complaint_text         = merged_text,
+        complainant_service_no = intake.complainant_service_no or "",
+        operator_id            = current_user.service_no,
+        complainant_name       = intake.complainant_name  or "",
+        complainant_unit       = intake.complainant_unit  or "",
+        complainant_rank       = intake.complainant_rank  or "",
+        existing_intake_id     = intake_id,  # update in-place
+    )
+
+    if result.status == "rejected":
+        raise HTTPException(
+            status_code=400,
+            detail=result.state.followup_question or "Clarification was rejected.",
+        )
+
+    candidates: list[CandidateApp] = [
+        CandidateApp(
+            application_id   = c["application_id"],
+            application_name = c["application_name"],
+            confidence_score = round(c["confidence_score"], 4),
+            is_primary       = c.get("is_primary", False),
+            expansion_reason = c.get("expansion_reason"),
+        )
+        for c in result.candidates
+    ]
+
+    return IntakeResponse(
+        intake_id            = result.intake_id,
+        corrected_text       = result.corrected_text,
+        is_repeat_caller     = result.is_repeat_caller,
+        potential_duplicates = result.potential_duplicates,
+        status               = result.status,
+        fault_type_proposal  = result.fault_type or "other",
+        severity_proposal    = result.severity   or "normal",
+        candidates           = candidates,
+        confidence           = result.state.confidence,
+        suggested_resolution = result.state.suggested_resolution,
+        needs_followup       = result.state.needs_followup,
+        followup_question    = result.state.followup_question,
+        followup_reason      = result.state.followup_reason,
+        clarification_attempts = result.clarification_attempts,
     )
 
 

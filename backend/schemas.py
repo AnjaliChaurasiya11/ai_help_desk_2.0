@@ -158,11 +158,39 @@ class IntakeResponse(BaseModel):
     """
     intake_id: int
     corrected_text: Optional[str] = None
-    is_repeat_caller: bool = False
-    potential_duplicates: list[DuplicateInfo] = Field(default_factory=list)
+    is_repeat_caller: bool = Field(..., description="True if caller has another active ticket.")
+    potential_duplicates: List[DuplicateInfo] = Field(default_factory=list)
+    status: str = Field(default="complete", description="Pipeline status: complete | pending_clarification | unable_to_identify")
     fault_type_proposal: str = Field(..., examples=["login/access"])
     severity_proposal: str = Field(..., examples=["high"])
     candidates: list[CandidateApp] = Field(default_factory=list)
+
+    # Reasoning fields — populated from the AI pipeline when ENABLE_AI_REASONING=True.
+    # All are optional so existing clients that ignore unknown fields are unaffected.
+    confidence: Optional[float] = Field(default=None, description="AI confidence in the classification (0.0–1.0).")
+    suggested_resolution: Optional[str] = Field(default=None, description="Recommended first-response action.")
+    needs_followup: bool = Field(default=False, description="True when the complaint is ambiguous and a clarifying question is needed.")
+    followup_question: Optional[str] = Field(default=None, description="Clarifying question to ask the operator/caller when needs_followup is True.")
+    followup_reason: Optional[str] = Field(default=None, description="Heuristic reason code: missing_target | missing_symptom | missing_context.")
+    clarification_attempts: Optional[int] = Field(default=0, description="Number of times the system asked for clarification.")
+
+
+# =====================================================================
+# CLARIFICATION SCHEMA (POST /api/intakes/{intake_id}/clarify)
+# =====================================================================
+
+class ClarifyRequest(BaseModel):
+    """
+    Sent when the operator submits the caller's clarification answer.
+    The pipeline merges this with the original complaint and re-runs
+    classification.
+    """
+    clarification_text: str = Field(
+        ...,
+        min_length=2,
+        examples=["SAP leave portal"],
+        description="The caller's answer to the follow-up question.",
+    )
 
 
 # =====================================================================

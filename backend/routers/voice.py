@@ -951,9 +951,10 @@ async def voice_complaint(
     # ────────────────────────────────────────────────────────────────────
 
 
+    current_session = session_manager.get_session(session_id)
     return VoiceComplaintResponse(
         session_id=session_id,
-        state=SessionState.OPERATOR_REVIEW.value,
+        state=current_session.state.value if current_session else SessionState.OPERATOR_REVIEW.value,
         transcript=proc_result.corrected_transcript,
         confidence=result.confidence,
         stt_language=result.language,
@@ -964,7 +965,6 @@ async def voice_complaint(
         candidates=proc_result.candidates,
         prompt_text=proc_result.prompt_text,
         # AI Reasoning layer
-        summary=proc_result.summary,
         suggested_resolution=proc_result.suggested_resolution,
         needs_followup=proc_result.needs_followup,
         followup_question=proc_result.followup_question,

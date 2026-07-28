@@ -140,6 +140,9 @@ class Settings(BaseSettings):
     # The system will return a realistic mock response so the UI can be built
     # and tested without needing access to the air-gapped vLLM server.
     MOCK_LLM: bool = False
+    
+    # Maximum number of clarification attempts before marking intake as unable_to_identify
+    MAX_CLARIFICATION_ATTEMPTS: int = 3
 
     class Config:
         env_file = ".env"
