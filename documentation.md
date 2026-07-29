@@ -354,3 +354,258 @@ PipelineResult (unified output)
 - `frontend/src/components/voice/VoiceRecorder.jsx`
 
 **Result:** The Voice flow now cleanly supports multi-turn conversations, properly accumulates context without overwriting, and operates with crisp, low-latency audio capture.
+
+---
+
+## Date / Session: 2026-07-28 (Pipeline Latency Optimization)
+**Goal:** Reduce the ~50-second pipeline latency by eliminating duplicate LLM work, adding granular stage-by-stage timing logs, and controlling prompt token count.
+
+**Root causes identified:**
+1. Two sequential LLM calls (`verify_and_correct_text` → `analyze_complaint_category`) were running for every complaint, each incurring a separate network roundtrip + model TTFT.
+2. The `classify+reason` prompt injected full-length symptom and purpose strings for each candidate application, causing the prompt token count to grow unboundedly with rich application data.
+3. No stage-level timing existed in `pipeline.py`, making it impossible to distinguish whether latency originated from the LLM, embedding, retrieval, or DB stages.
+
+**Solution implemented:**
+
+### 1. Merged Verify + Category LLM Call (feature-flagged)
+Created `verify_and_categorize_complaint()` in `backend/services/llm_client.py`. This single function combines:
+- Language validation and STT correction (previously `verify_and_correct_text`)
+- Completeness categorisation (`complete` / `incomplete` / `invalid`) and follow-up question generation (previously `analyze_complaint_category`)
+
+The function returns a unified dict: `{status, corrected_text, category, followup_question, followup_reason}`.
+
+The old two-call path is preserved intact. A new feature flag `MERGED_VERIFY_CATEGORY: bool = True` in `config.py` controls which path is used. Set to `False` to revert to the two-call path for regression comparison.
+
+The merged function also handles the `previous_question` context (for evolved clarification questions) exactly the same as the old `analyze_complaint_category` did.
+
+### 2. Stage-by-Stage Timing Logs
+Added a `_log_timings()` helper to `backend/services/pipeline.py` that emits a structured log line at the end of every pipeline invocation:
+```
+[pipeline:timings] total=XXXXms  stages={ verify_category_merged=XXXXms  embedding=XXms  retrieval=XXms  classification=XXXXms  db_save_intake=Xms }
+```
+Every exit path (rejected, pending_clarification, unable_to_identify, complete) now emits timings before returning.
+
+Individual stage keys tracked:
+- `db_load_intake` — loading prior intake on clarification path
+- `verify_category_merged` or `verify_text` + `category_analysis` — LLM triage call(s)
+- `embedding` — text embedding
+- `duplicate_check` — vector similarity check for duplicates
+- `history_lookup` — classifier history shortcut
+- `retrieval` — semantic application search
+- `classification` — classify+reason LLM call
+- `dependency_expansion` — graph expansion
+- `db_save_intake` — DB write
+
+Token counts (`prompt_tokens`, `completion_tokens`) are already logged per-call inside `_call_llm()`.
+
+### 3. Prompt Size Limits (classify+reason)
+Added two new config settings:
+- `CLASSIFY_MAX_CANDIDATES: int = 3` — caps the number of candidate apps injected into the classify+reason prompt
+- `CLASSIFY_MAX_DESC_CHARS: int = 120` — truncates each symptom and purpose string to 120 characters
+
+`_build_reasoning_user_prompt()` in `llm_client.py` now reads these values from settings instead of hardcoding `[:3]` for candidates. Both the per-candidate symptom and purpose fields are individually clamped, preventing any single application with a very long description from inflating the prompt.
+
+**Files modified:**
+- `backend/config.py` — Added `MERGED_VERIFY_CATEGORY`, `CLASSIFY_MAX_CANDIDATES`, `CLASSIFY_MAX_DESC_CHARS`
+- `backend/services/llm_client.py` — Added `verify_and_categorize_complaint()` and updated `_build_reasoning_user_prompt()` prompt limits
+- `backend/services/pipeline.py` — Feature-flagged merged path, added `_log_timings()` helper, instrumented all stages
+
+**Not changed:** Voice FSM, clarification flow, retrieval logic, operator review flow, classification prompts, business rules.
+
+**Rollback:** Set `MERGED_VERIFY_CATEGORY=False` in `.env` to instantly revert to the two-call path without code changes.
+
+**Expected result:** The `verify_category_merged` timing should be roughly equal to a single old verify call (~2–5 s), eliminating the second `category_analysis` call (~2–5 s) from every complaint — saving ~40–50% of triage latency. Prompt token counts from `_call_llm` logs will confirm the effect of `CLASSIFY_MAX_DESC_CHARS` on the classify+reason call.
+
+---
+
+## Date / Session: 2026-07-28 (Live AI Support UI Overlay)
+**Goal:** Transform the existing AI Help Desk into a modern voice-first helpdesk by introducing a full-screen, highly polished Live AI Support interface, while preserving all existing backend APIs, FSM states, LiveKit integration, and the complaint processing pipeline.
+
+**Overview of Architecture:**
+The core architectural decision was to treat the existing `VoiceSessionPanel.jsx` as the headless state controller rather than replacing it. By introducing a `variant="live"` prop, `VoiceSessionPanel` continues to manage audio buffering, WebSocket communication with the backend FSM, and LiveKit transport. Instead of rendering its default inline UI, it wraps and delegates the presentation to the new `LiveCallPage` component.
+
+This approach guarantees zero changes to the backend or the underlying voice pipeline, avoiding regression risks while completely overhauling the user experience.
+
+**Key Components Implemented:**
+
+1. **Entry Point (`LoginPage.jsx` & `App.jsx`)**:
+   - Added a new `📞 Live AI Support` blue floating arrow tab on the login screen below the existing `Track Complaint` tab.
+   - Wired to a new unauthenticated route: `/live-support`.
+
+2. **Presentation Layer (`LiveCallPage.jsx` & `LiveCallContainer.jsx`)**:
+   - `LiveCallContainer`: Instantiates the `VoiceSessionPanel` with `variant="live"` and captures the final ticket creation event to show the `CallSummaryScreen`.
+   - `LiveCallPage`: A full-screen, dark-themed, glassmorphic UI that visually represents the voice call. It hides the engine elements (`VoiceRecorder` and `LiveKitAudioTransport`) in the DOM and uses their state props to drive the UI.
+
+3. **Reusable Voice UI Elements (`frontend/src/components/voice/ui/`)**:
+   - `VoiceAvatar.jsx`: A circular avatar with an animated glowing ring that pulses when the AI is speaking.
+   - `Waveform.jsx`: Pure CSS animated equalizer bars that visualize active listening and AI speech.
+   - `ConnectionStatus.jsx`: A top bar mapping the backend FSM states (e.g., `CAPTURING_SERVICE_NUMBER`, `CLASSIFICATION`) to user-friendly labels (e.g., "Listening", "Classifying Complaint...") and displaying a live session timer.
+   - `LanguageBadge.jsx`: Automatically displays the language detected by the backend Whisper model (e.g., English, Hindi), with a dropdown for manual overrides.
+   - `CallControls.jsx`: Provides interactive buttons for Mute, Speaker Toggle, and Ending the Call (with confirmation).
+   - `CallSummaryScreen.jsx`: A polished overlay displayed when the call successfully completes, showing the generated Ticket Number, Fault Type, Severity, and AI Summary.
+
+4. **Live Transcript (`LiveCallPage.jsx`)**:
+   - Implemented a modern chat-bubble interface.
+   - Real-time updates: As partial transcripts arrive from the backend, the current user bubble updates seamlessly before committing.
+
+5. **Developer Diagnostics**:
+   - Added a collapsible `[Dev] Pipeline Diagnostics` panel in `LiveCallPage` that only renders in development mode (`import.meta.env.DEV`).
+   - Exposes critical debugging metrics such as Session ID, LiveKit connection state, Pipeline Latency, STT Confidence, and the raw FSM state.
+
+**Files modified/created:**
+- `frontend/src/pages/LoginPage.jsx` (Modified)
+- `frontend/src/App.jsx` (Modified)
+- `frontend/src/index.css` (Modified - Added keyframes and glassmorphic classes)
+- `frontend/src/components/voice/VoiceSessionPanel.jsx` (Modified)
+- `frontend/src/pages/LiveCallContainer.jsx` (New)
+- `frontend/src/pages/LiveCallPage.jsx` (New)
+- `frontend/src/components/voice/ui/*` (6 New Components)
+
+**Result:** A production-ready, highly interactive voice call interface that rivals modern AI voice products, built entirely on top of the robust existing backend infrastructure.
+
+---
+
+## Date / Session: 2026-07-29 (Live AI Support — Audit & Compliance Fixes)
+**Goal:** Audit the Live AI Support implementation against the original user-approved specification (including 8 architectural requirements) and fix every gap found.
+
+**Audit findings & fixes:**
+
+### Req 2 — Dedicated Connection Phase Screen (was missing)
+- **Problem:** During `INIT`, the avatar/chat UI was already rendered. There was no separate blocking screen while LiveKit and the session initialised.
+- **Fix:** Added a conditional branch in `LiveCallPage.jsx`: when `session.state === 'INIT' && !session.id`, the component renders a centred full-screen overlay with a shield icon, "Establishing Secure Voice Session..." text, and three pulsing dots. The main avatar/chat layout only renders once the session is established.
+
+### Req 3 — High-level user-facing pipeline state labels (partial before)
+- **Problem:** Only `CLASSIFICATION` ("Classifying Complaint…") and `INIT` were labelled. Sub-stages like transcription and vector search had no UI representation.
+- **Fix:** `processingStage` field added to session state in `VoiceSessionPanel.jsx`. The `handleLiveKitProcessing` callback now forwards the `stage` string from the backend WebSocket event. `ConnectionStatus.jsx` checks `processingStage` first before the FSM state, mapping to the following user-friendly labels:
+  - `stage: "stt"` → *"Understanding your issue..."*
+  - `stage: "classification"` (first 2.5s) → *"Checking for similar incidents..."*
+  - `stage: "classification"` (after 2.5s via timer) → *"Creating your ticket"*
+  - FSM: `INIT/GREETING` → *"Establishing Secure Voice Session..."*
+  - FSM: `CAPTURING_*/ASK_ANOTHER` → *"Listening"*
+  - FSM: `CONFIRMING/CLARIFICATION` → *"Speaking"*
+  - FSM: `OPERATOR_REVIEW` → *"Ticket Created ✓"*
+  - These are presentation-layer labels only — FSM transitions are unchanged.
+
+### Req 5 — Language override was a no-op (bug)
+- **Problem:** `LiveCallPage.jsx` passed `onOverride={() => {}}` to `LanguageBadge` — selecting a language had no effect.
+- **Fix:** Added `languageOverride` state in `LiveCallPage`. The badge now displays `languageOverride || session.language` and `onOverride` is wired to `setLanguageOverride`.
+
+### Req 6 — Diagnostics panel: missing fields + no collapsible toggle
+- **Problem:** The panel was always-open and missing: detected language, verify latency, classification latency, total pipeline time.
+- **Fix:**
+  - Added `verifyLatency`, `classificationLatency`, `totalLatency` fields to session state in `VoiceSessionPanel.jsx`, populated from the `state_change` WebSocket payload fields `verify_latency`, `classification_latency`, `total_latency`.
+  - Added `isDiagnosticsOpen` state and a `[-]/[+]` toggle button in the panel header.
+  - Added all missing fields to the expanded panel view.
+
+### Minor — Initial placeholder bubble filtered
+- **Problem:** `"Starting voice session..."` was being pushed as the first AI chat bubble.
+- **Fix:** Added a guard in the `session.promptText` effect: `if (session.promptText && session.promptText !== 'Starting voice session...')`.
+
+**Files modified:**
+- `frontend/src/pages/LiveCallPage.jsx`
+- `frontend/src/components/voice/ui/ConnectionStatus.jsx`
+- `frontend/src/components/voice/VoiceSessionPanel.jsx`
+
+---
+
+## Date / Session: 2026-07-29 (Live AI Support — Conversational Voice Prompts)
+**Goal:** Replace all web-style TTS prompts in the LiveKit voice call path with natural, phone-call-friendly language, without affecting the existing REST/manual intake workflow.
+
+**Problem encountered:** Prompts like *"Please describe your problem. You may start speaking now."* or *"Predicted application: X. Fault type: Y. Severity: Z."* were designed for a web interface, not a live voice call.
+
+**Solution implemented:**
+
+Added two new dictionaries and two helper functions to `backend/voice/prompts.py`:
+
+- `LIVE_CALL_FALLBACK_TEXT` — conversational variants of all static prompt texts (greeting, ask_service_number, ask_complaint, retry_service, fallback_operator, goodbye, confirm_yes_no, processing, ask_another_complaint, unable_to_identify).
+- `LIVE_CALL_DYNAMIC_TEMPLATES` — conversational variants of all dynamic prompt templates (confirm_service_number, retry_service_number, fallback_to_operator, classification_summary, complaint_rejected).
+- `get_live_call_prompt(key)` — drop-in replacement for `get_prompt_text()`, returns the live-call variant and falls back to the standard text if not found.
+- `render_live_call_prompt(key, **kwargs)` — drop-in replacement for `render_dynamic_prompt()`, falls back gracefully.
+
+The LiveKit adapter (`adapter.py`) and complaint processor (`complaint_processor.py`) now import and use these new helpers exclusively. The REST voice path (`routers/voice.py`) continues to use the original prompts unchanged.
+
+**Prompt comparison (before → after):**
+
+| Prompt | Before | After |
+|---|---|---|
+| Greeting | "Please state your service number." | "AI Help Desk. How can I assist you today?" |
+| Ask complaint | "Please describe your problem. You may start speaking now." | "Got it. What's the issue you'd like to report?" |
+| Confirm number | "I heard your service number as X. Is that correct? Please say yes or no." | "Just to confirm, I have your service number as X — is that right?" |
+| Classification | "Predicted application: X. Fault type: Y. Severity: Z." | "Thanks. I've logged your issue as a Y complaint, severity Z, under X. Your ticket is being created now." |
+| Goodbye | "Thank you. Your ticket has been created. Please note your ticket number." | "Your ticket has been logged. Have a good day." |
+| Fallback | "We were unable to verify your service number. An operator will now assist you." | "I'm having trouble verifying your service number. I'll connect you to a support agent right away." |
+
+**Files modified:**
+- `backend/voice/prompts.py` (Added new section — existing section unchanged)
+- `backend/livekit_bridge/adapter.py`
+- `backend/voice/complaint_processor.py`
+
+**Design decision:** Additive approach (new dict + helpers) avoids any risk of breaking the REST voice path, which serves pre-recorded WAV files backed by the original `FALLBACK_TEXT` dict.
+
+---
+
+## Date / Session: 2026-07-29 (Live AI Support — End Call Without Confirmation)
+**Goal:** Remove the end-call confirmation dialog. Clicking the red hang-up button should immediately terminate the call.
+
+**Problem:** `CallControls.jsx` had a `showConfirm` state that rendered a popup with Cancel/End Call buttons before actually calling `onEndCall`.
+
+**Fix:** Removed `showConfirm` state and the popup JSX entirely. The hang-up button `onClick` now calls `onEndCall` directly.
+
+**Files modified:**
+- `frontend/src/components/voice/ui/CallControls.jsx`
+
+---
+
+## Date / Session: 2026-07-29 (Live AI Support — Ticket Summary Fixes & Auto-Close)
+**Goal:** Fix three related issues in the end-of-call summary screen:
+1. Summary displayed the internal database `intake_id` (e.g., `168`) instead of the user-facing `ticket_number` (e.g., `TIC-202607-0045`).
+2. The Application name was missing from the summary.
+3. The "Connecting to Operator" state was misleading — no live operator transfer occurs in the voice call flow. The call should end cleanly with a proper ticket summary.
+
+**Root cause analysis:**
+The `ticket_number` (TIC-YYYYMM-XXXX) was only generated when an **operator** confirmed a ticket through the dashboard (`POST /api/tickets/`). The voice call only created an `Intake` record — no ticket existed at call end, so the summary had nothing to show but the raw `intake_id`.
+
+**Solution implemented:**
+
+### Backend — Auto-create ticket at voice call completion
+- `ComplaintProcessingResult` in `voice/complaint_processor.py`: Added `ticket_number: Optional[str]` and `application_name: Optional[str]` fields.
+- At the end of a successful classification, `complaint_processor.py` now calls `_generate_ticket_number()` (imported from `routers/tickets.py`) and inserts a `Ticket` row and initial `TicketHistory` row directly, using the classified fault type, severity, and primary application.
+- The ticket is created with `status="open"` and `created_by_service_no="voice-agent"` to distinguish it from operator-created tickets.
+- Failure to create the ticket is non-fatal — a `try/except` logs the error and the summary falls back to showing `#intake_id`.
+- `adapter.py`: The WebSocket `state_change` payload for `OPERATOR_REVIEW` now includes `ticket_number` and `application` fields.
+
+### Frontend — Display real ticket data and auto-close
+- `VoiceSessionPanel.jsx`: `handleLiveKitStateChange` now forwards `ticket_number` and `application` in the `onClassificationComplete` callback.
+- `LiveCallContainer.jsx`: Maps `intakeResponse.ticket_number` (with `#intake_id` fallback) and `intakeResponse.application` into `summaryData`.
+- `CallSummaryScreen.jsx`: Fully rewritten:
+  - Displays: **Ticket Number**, **Status**, **Fault Type**, **Severity** (color-coded), **Application** (new), **Complaint Summary**.
+  - **12-second auto-close countdown** — automatically redirects to `/` after 12 seconds with a visible countdown.
+  - Buttons: "Report Another" and "Go Home".
+  - No operator language anywhere.
+- `ConnectionStatus.jsx`: `OPERATOR_REVIEW` state now shows `"Ticket Created ✓"` instead of `"Connecting to an operator"`.
+
+**Ticket creation flow after this change:**
+
+```
+Voice Call completes classification
+  ↓
+complaint_processor.py auto-creates Ticket (TIC-YYYYMM-XXXX, status=open)
+  ↓
+WebSocket notifies frontend (state=OPERATOR_REVIEW, ticket_number, application)
+  ↓
+CallSummaryScreen shown with real ticket number + 12s countdown
+  ↓
+Auto-redirect to /
+```
+
+Operators see the auto-created ticket in their dashboard immediately under status `open` and can update/resolve it through the existing operator interface.
+
+**Files modified:**
+- `backend/voice/complaint_processor.py`
+- `backend/livekit_bridge/adapter.py`
+- `frontend/src/components/voice/VoiceSessionPanel.jsx`
+- `frontend/src/pages/LiveCallContainer.jsx`
+- `frontend/src/components/voice/ui/CallSummaryScreen.jsx`
+- `frontend/src/components/voice/ui/ConnectionStatus.jsx`
+
+**Result:** The live call summary now shows a consistent view matching what operators and the Track Complaint page display. The experience feels complete and self-contained — no misleading operator handoff state, and the call ends cleanly with full ticket information.

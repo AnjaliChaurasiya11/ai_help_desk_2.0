@@ -29,19 +29,20 @@ class TicketClassifier:
         self,
         session: Session,
         embedding: List[float],
-    ) -> Tuple[Optional[str], Optional[str]]:
+    ) -> Tuple[Optional[int], Optional[str], Optional[str]]:
         """
         Searches learning_examples for a highly-confident past ticket (cosine
-        distance < 0.08, i.e. similarity > 92%) and returns BOTH
-        (confirmed_fault_type, confirmed_severity) in a single DB query.
+        distance < 0.08, i.e. similarity > 92%) and returns ALL historically
+        confirmed fields (confirmed_app_id, confirmed_fault_type, confirmed_severity)
+        in a single DB query.
 
-        Returns (None, None) if no close enough match is found.
+        Returns (None, None, None) if no close enough match is found.
         Replaces the two separate _get_history_match() calls that previously
         each executed an independent pgvector query for the same row.
         """
         embedding_str = "[" + ",".join(map(str, embedding)) + "]"
         query = text("""
-            SELECT confirmed_fault_type, confirmed_severity,
+            SELECT confirmed_app_id, confirmed_fault_type, confirmed_severity,
                    (text_embedding <=> :embedding) AS distance
             FROM learning_examples
             ORDER BY distance ASC LIMIT 1
@@ -49,9 +50,9 @@ class TicketClassifier:
 
         result = session.execute(query, {"embedding": embedding_str}).first()
         if result and result.distance is not None and float(result.distance) < 0.08:
-            return result.confirmed_fault_type or None, result.confirmed_severity or None
+            return result.confirmed_app_id, result.confirmed_fault_type or None, result.confirmed_severity or None
 
-        return None, None
+        return None, None, None
 
     # ------------------------------------------------------------------
     # Internal: kept for backward compatibility with legacy callers
@@ -62,7 +63,7 @@ class TicketClassifier:
         class that still use the old per-category API.  Internally delegates
         to the combined query.
         """
-        fault_match, severity_match = self._get_history_match_combined(session, embedding)
+        _, fault_match, severity_match = self._get_history_match_combined(session, embedding)
         if category == "fault_type":
             return fault_match
         elif category == "severity":
@@ -100,7 +101,7 @@ class TicketClassifier:
         cleaned = text_content.strip()
 
         # Step 1: single DB lookup — may resolve both labels without any LLM call
-        fault_from_history, severity_from_history = self._get_history_match_combined(session, embedding)
+        _, fault_from_history, severity_from_history = self._get_history_match_combined(session, embedding)
 
         if fault_from_history and severity_from_history:
             logger.info(
@@ -137,7 +138,7 @@ class TicketClassifier:
             return "other"
 
         # 1. Try history match first (preserves the learning loop)
-        history_match, _ = self._get_history_match_combined(session, embedding)
+        _, history_match, _ = self._get_history_match_combined(session, embedding)
         if history_match:
             logger.info("[AI] History match found for fault_type: %s", history_match)
             return history_match
@@ -201,13 +202,13 @@ class TicketClassifier:
         cleaned = text_content.strip()
 
         # Phase A: history shortcut — DB only, no LLM, no extra queries
-        fault_from_history, severity_from_history = self._get_history_match_combined(session, embedding)
+        history_app_id, fault_from_history, severity_from_history = self._get_history_match_combined(session, embedding)
 
-        if fault_from_history and severity_from_history:
+        if history_app_id and fault_from_history and severity_from_history:
             logger.info(
                 "[AI] classify_and_reason_complaint: history hit "
-                "(fault=%s, severity=%s) — LLM + enrichment skipped",
-                fault_from_history, severity_from_history,
+                "(app_id=%s, fault=%s, severity=%s) — LLM + enrichment skipped",
+                history_app_id, fault_from_history, severity_from_history,
             )
             reasoning = {
                 "fault_type": fault_from_history,
@@ -216,6 +217,7 @@ class TicketClassifier:
                 "suggested_resolution": "",
                 "needs_followup": False,
                 "followup_question": None,
+                "history_app_id": history_app_id,
             }
             return fault_from_history, severity_from_history, reasoning, True
 

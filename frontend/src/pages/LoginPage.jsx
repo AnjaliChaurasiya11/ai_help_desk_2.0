@@ -56,18 +56,78 @@ export default function LoginPage() {
           </div>
         )}
 
-        <div style={{
-          textAlign: 'center', marginTop: 24, paddingTop: 16,
-          borderTop: '1px solid var(--border)'
-        }}>
-          <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: 8 }}>
-            Looking for an existing ticket?
-          </p>
-          <Link to="/track" className="btn btn-outline btn-sm" style={{ width: '100%', justifyContent: 'center' }}>
-            🔍 Track a Complaint
-          </Link>
-        </div>
       </div>
+
+      {/* Side Track Tab (Red Arrow) */}
+      <Link
+        to="/track"
+        style={{
+          position: 'fixed',
+          left: 0,
+          top: '120px',
+          backgroundColor: 'var(--danger)',
+          padding: '10px 24px 10px 16px',
+          clipPath: 'polygon(0% 0%, 85% 0%, 100% 50%, 85% 100%, 0% 100%)',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'flex-start',
+          textDecoration: 'none',
+          zIndex: 1000,
+          transition: 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), background-color 0.2s',
+          filter: 'drop-shadow(2px 4px 6px rgba(0,0,0,0.4))',
+        }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.transform = 'translateX(6px)';
+          e.currentTarget.style.backgroundColor = '#dc2626';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.transform = 'translateX(0)';
+          e.currentTarget.style.backgroundColor = 'var(--danger)';
+        }}
+      >
+        <div style={{ fontSize: '0.65rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.85)' }}>
+          Existing ticket?
+        </div>
+        <div style={{ fontSize: '0.9rem', fontWeight: '700', color: '#ffffff', marginTop: '1px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+          Track Complaint
+        </div>
+      </Link>
+
+      {/* Live AI Support Tab (Blue Arrow) */}
+      <Link
+        to="/live-support"
+        className="live-ai-entry-card"
+        style={{
+          position: 'fixed',
+          left: 0,
+          top: '200px',
+          backgroundColor: 'var(--accent)',
+          padding: '10px 24px 10px 16px',
+          clipPath: 'polygon(0% 0%, 85% 0%, 100% 50%, 85% 100%, 0% 100%)',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'flex-start',
+          textDecoration: 'none',
+          zIndex: 1000,
+          transition: 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), background-color 0.2s',
+          filter: 'drop-shadow(2px 4px 6px rgba(0,0,0,0.4))',
+        }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.transform = 'translateX(6px)';
+          e.currentTarget.style.backgroundColor = 'var(--accent-dim)';
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.transform = 'translateX(0)';
+          e.currentTarget.style.backgroundColor = 'var(--accent)';
+        }}
+      >
+        <div style={{ fontSize: '0.65rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.85)' }}>
+          📞 Live AI Support
+        </div>
+        <div style={{ fontSize: '0.9rem', fontWeight: '700', color: '#ffffff', marginTop: '1px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+          Talk to AI Help Desk
+        </div>
+      </Link>
     </div>
   );
 }

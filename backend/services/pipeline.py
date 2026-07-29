@@ -66,6 +66,16 @@ def _get_services() -> Tuple[TextEmbedder, TicketClassifier, ApplicationSearchEn
     return _embedder, _classifier, _search_engine, _dependency_engine
 
 
+def _log_timings(timings: Dict[str, float], total_s: float) -> None:
+    """Emit a structured, human-readable stage-by-stage latency breakdown."""
+    rows = "  ".join(f"{k}={v:.0f}ms" for k, v in timings.items())
+    logger.info(
+        "[pipeline:timings] total=%.0fms  stages={ %s }",
+        total_s * 1000,
+        rows,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
@@ -308,8 +318,16 @@ def process_complaint(
           "pending_clarification" — insufficient complaint; follow-up question set
           "complete"              — classification finished; ticket proposal ready
     """
+    import time as _time
     from config import settings
-    from services.llm_client import verify_and_correct_text, analyze_complaint_category
+    from services.llm_client import (
+        verify_and_correct_text,
+        analyze_complaint_category,
+        verify_and_categorize_complaint,
+    )
+
+    t_total_start = _time.perf_counter()
+    _timings: Dict[str, float] = {}
 
     embedder, classifier, search_engine, dependency_engine = _get_services()
 
@@ -317,62 +335,110 @@ def process_complaint(
     attempts = 0
     previous_question: Optional[str] = None
     if existing_intake_id:
+        t0 = _time.perf_counter()
         existing_intake = session.get(Intake, existing_intake_id)
+        _timings["db_load_intake"] = (_time.perf_counter() - t0) * 1000
         if existing_intake:
             attempts = existing_intake.clarification_attempts
             previous_question = existing_intake.last_followup_question
 
-    # ── [1] GUARDRAIL ────────────────────────────────────────────────────────
-    guardrail_result = verify_and_correct_text(complaint_text)
-    if guardrail_result["status"] == "rejected":
-        reason_text = guardrail_result.get("reason", "Complaint could not be processed.")
-        state = ConversationState(
-            complaint_text  = complaint_text,
-            needs_followup  = False,
-            is_sufficient   = False,
-            followup_reason = "rejected",
-            followup_question = reason_text,
-        )
-        logger.info("[pipeline] Guardrail rejected: %s", reason_text)
-        return PipelineResult(
-            status         = "rejected",
-            state          = state,
-            corrected_text = complaint_text,
-        )
+    # ── [1+2] GUARDRAIL + CATEGORY ──────────────────────────────────────────
+    # When MERGED_VERIFY_CATEGORY is True a single LLM call covers both
+    # verification (language check + STT correction) and completeness
+    # categorisation.  The old two-call path is preserved behind the flag
+    # for regression testing / easy rollback.
 
-    corrected_text = guardrail_result.get("corrected_text", complaint_text)
+    t_vc_start = _time.perf_counter()
 
-    # ── [2] CATEGORY ANALYSIS ─────────────────────────
-    category_result = analyze_complaint_category(corrected_text, previous_question=previous_question)
-    cat = category_result.get("category", "complete")
+    if settings.MERGED_VERIFY_CATEGORY:
+        # ── MERGED PATH (single LLM call) ────────────────────────────────
+        merged = verify_and_categorize_complaint(complaint_text, previous_question=previous_question)
+        _timings["verify_category_merged"] = (_time.perf_counter() - t_vc_start) * 1000
 
-    # ── [3a] INVALID PATH ───────────────────────
+        if merged["status"] == "rejected" or merged["category"] == "invalid":
+            reason_text = merged.get("followup_question") or "Complaint could not be processed."
+            state = ConversationState(
+                complaint_text    = complaint_text,
+                needs_followup    = False,
+                is_sufficient     = False,
+                followup_reason   = "rejected",
+                followup_question = reason_text,
+            )
+            logger.info("[pipeline] Merged verify+category rejected: %s", reason_text)
+            _log_timings(_timings, _time.perf_counter() - t_total_start)
+            return PipelineResult(
+                status         = "rejected",
+                state          = state,
+                corrected_text = complaint_text,
+            )
+
+        corrected_text = merged.get("corrected_text") or complaint_text
+        cat = merged.get("category", "complete")
+        category_result = {
+            "category":          cat,
+            "followup_question": merged.get("followup_question"),
+            "followup_reason":   merged.get("followup_reason"),
+        }
+
+    else:
+        # ── LEGACY TWO-CALL PATH ─────────────────────────────────────────
+        t_v = _time.perf_counter()
+        guardrail_result = verify_and_correct_text(complaint_text)
+        _timings["verify_text"] = (_time.perf_counter() - t_v) * 1000
+
+        if guardrail_result["status"] == "rejected":
+            reason_text = guardrail_result.get("reason", "Complaint could not be processed.")
+            state = ConversationState(
+                complaint_text    = complaint_text,
+                needs_followup    = False,
+                is_sufficient     = False,
+                followup_reason   = "rejected",
+                followup_question = reason_text,
+            )
+            logger.info("[pipeline] Guardrail rejected: %s", reason_text)
+            _log_timings(_timings, _time.perf_counter() - t_total_start)
+            return PipelineResult(
+                status         = "rejected",
+                state          = state,
+                corrected_text = complaint_text,
+            )
+
+        corrected_text = guardrail_result.get("corrected_text", complaint_text)
+
+        t_cat = _time.perf_counter()
+        category_result = analyze_complaint_category(corrected_text, previous_question=previous_question)
+        _timings["category_analysis"] = (_time.perf_counter() - t_cat) * 1000
+        cat = category_result.get("category", "complete")
+
+    # ── [3a] INVALID PATH ────────────────────────────────────────────────────
     if cat == "invalid":
         reason_text = category_result.get("followup_question") or "Please describe your IT issue."
         state = ConversationState(
-            complaint_text  = corrected_text,
-            needs_followup  = False,
-            is_sufficient   = False,
-            followup_reason = "invalid_category",
+            complaint_text    = corrected_text,
+            needs_followup    = False,
+            is_sufficient     = False,
+            followup_reason   = "invalid_category",
             followup_question = reason_text,
         )
         logger.info("[pipeline] Invalid category rejected: %s", reason_text)
+        _log_timings(_timings, _time.perf_counter() - t_total_start)
         return PipelineResult(
             status         = "rejected",
             state          = state,
             corrected_text = corrected_text,
         )
 
-    # ── [3b] INCOMPLETE PATH ───────────────────────
+    # ── [3b] INCOMPLETE PATH ─────────────────────────────────────────────────
     if cat == "incomplete":
         if attempts >= settings.MAX_CLARIFICATION_ATTEMPTS:
             state = ConversationState(
-                complaint_text  = corrected_text,
-                needs_followup  = False,
-                is_sufficient   = False,
-                followup_reason = "max_attempts_reached",
+                complaint_text    = corrected_text,
+                needs_followup    = False,
+                is_sufficient     = False,
+                followup_reason   = "max_attempts_reached",
                 followup_question = None,
             )
+            t_db = _time.perf_counter()
             intake = _save_intake(
                 session                = session,
                 complaint_text         = corrected_text,
@@ -384,7 +450,9 @@ def process_complaint(
                 complainant_rank       = complainant_rank,
                 existing_intake_id     = existing_intake_id,
             )
+            _timings["db_save_intake"] = (_time.perf_counter() - t_db) * 1000
             logger.info("[pipeline] Clarification attempts exhausted. Status: unable_to_identify.")
+            _log_timings(_timings, _time.perf_counter() - t_total_start)
             return PipelineResult(
                 status              = "unable_to_identify",
                 state               = state,
@@ -395,12 +463,13 @@ def process_complaint(
 
         followup_q = category_result.get("followup_question", "Can you provide more details about the system or application?")
         state = ConversationState(
-            complaint_text  = corrected_text,
-            is_sufficient   = False,
-            needs_followup  = True,
-            followup_reason = category_result.get("followup_reason", "incomplete_complaint"),
+            complaint_text    = corrected_text,
+            is_sufficient     = False,
+            needs_followup    = True,
+            followup_reason   = category_result.get("followup_reason", "incomplete_complaint"),
             followup_question = followup_q,
         )
+        t_db = _time.perf_counter()
         intake = _save_intake(
             session                = session,
             complaint_text         = corrected_text,
@@ -413,7 +482,9 @@ def process_complaint(
             existing_intake_id     = existing_intake_id,
             last_followup_question = followup_q,
         )
+        _timings["db_save_intake"] = (_time.perf_counter() - t_db) * 1000
         logger.info("[pipeline] Incomplete complaint — follow-up: %r", state.followup_question)
+        _log_timings(_timings, _time.perf_counter() - t_total_start)
         return PipelineResult(
             status              = "pending_clarification",
             state               = state,
@@ -424,27 +495,35 @@ def process_complaint(
             severity            = "normal",
         )
 
-    # ── [3c] COMPLETE PATH (cat == "complete") ──────────────────────────────
+    # ── [3c] COMPLETE PATH (cat == "complete") ───────────────────────────────
 
-    # ── [4] EMBEDDING ────────────────────────────────────────────────────────
+    # ── [4] EMBEDDING ─────────────────────────────────────────────────────────
+    t_emb = _time.perf_counter()
     embedding = embedder.get_embedding(corrected_text)
+    _timings["embedding"] = (_time.perf_counter() - t_emb) * 1000
 
-    # ── [5] DUPLICATE / REPEAT CHECK ─────────────────────────────────────────
+    # ── [5] DUPLICATE / REPEAT CHECK ──────────────────────────────────────────
+    t_dup = _time.perf_counter()
     potential_duplicates, is_repeat = _check_duplicates(
         session, embedding, complainant_service_no
     )
+    _timings["duplicate_check"] = (_time.perf_counter() - t_dup) * 1000
 
-    # ── [6] HISTORY SHORTCUT ─────────────────────────────────────────────────
-    history_fault, history_severity = classifier._get_history_match_combined(session, embedding)
+    # ── [6] HISTORY SHORTCUT ──────────────────────────────────────────────────
+    t_hist = _time.perf_counter()
+    history_app_id, history_fault, history_severity = classifier._get_history_match_combined(session, embedding)
     history_hit = bool(history_fault and history_severity)
+    _timings["history_lookup"] = (_time.perf_counter() - t_hist) * 1000
 
     reasoning: Dict[str, Any] = {}
     enriched_candidates: List[Dict[str, Any]] = []
 
-    # ── [7] RETRIEVAL ─────────────────────────────────────────────────
+    # ── [7] RETRIEVAL ──────────────────────────────────────────────────────────
     # Always run retrieval to populate UI candidates, even if LLM is skipped
+    t_ret = _time.perf_counter()
     raw_candidates    = search_engine.search_candidates(session, embedding)
     enriched_candidates = _enrich_candidates(session, raw_candidates, corrected_text)
+    _timings["retrieval"] = (_time.perf_counter() - t_ret) * 1000
 
     if history_hit:
         fault_type = history_fault
@@ -453,21 +532,39 @@ def process_complaint(
             "confidence": 1.0,
             "suggested_resolution": "",
         }
+        
+        # If the history match explicitly provides a confirmed_app_id, use it!
+        if history_app_id:
+            from models import Application
+            hist_app = session.get(Application, history_app_id)
+            if hist_app:
+                # Remove it if it was already in the list
+                enriched_candidates = [c for c in enriched_candidates if c["application_id"] != history_app_id]
+                # Prepend as the guaranteed primary candidate
+                enriched_candidates.insert(0, {
+                    "application_id":   hist_app.id,
+                    "application_name": hist_app.name,
+                    "confidence_score": 1.0,
+                    "is_primary":       True,
+                    "expansion_reason": "Matched from identical historical ticket",
+                })
+                
         logger.info(
-            "[pipeline] History hit (fault=%s, severity=%s) — LLM skipped.",
-            fault_type, severity,
+            "[pipeline] History hit (app_id=%s, fault=%s, severity=%s) — LLM skipped.",
+            history_app_id, fault_type, severity,
         )
     else:
-        # ── [8] LLM CLASSIFICATION + REASONING ───────────────────────────
+        # ── [8] LLM CLASSIFICATION + REASONING ──────────────────────────────
+        t_cls = _time.perf_counter()
         if settings.ENABLE_AI_REASONING:
-            top_ids = [c["application_id"] for c in enriched_candidates[:3]]
+            top_ids = [c["application_id"] for c in enriched_candidates[:settings.CLASSIFY_MAX_CANDIDATES]]
             symptoms, purposes = _fetch_app_context(session, top_ids)
 
             fault_type, severity, reasoning, _ = classifier.classify_and_reason_complaint(
                 session        = session,
                 text_content   = corrected_text,
                 embedding      = embedding,
-                candidate_apps = enriched_candidates[:3],
+                candidate_apps = enriched_candidates[:settings.CLASSIFY_MAX_CANDIDATES],
                 symptoms       = symptoms,
                 purposes       = purposes,
             )
@@ -477,18 +574,21 @@ def process_complaint(
                 "confidence": 0.0,
                 "suggested_resolution": None,
             }
+        _timings["classification"] = (_time.perf_counter() - t_cls) * 1000
 
-    # ── [9] CONFIDENCE GATE ──────────────────────────────────────────────────
+    # ── [9] CONFIDENCE GATE ───────────────────────────────────────────────────
     # Removed: category analysis entirely determines if we need follow-up
     confidence = float(reasoning.get("confidence", 0.0))
 
-    # ── [10] DEPENDENCY EXPANSION ────────────────────────────────────────────
+    # ── [10] DEPENDENCY EXPANSION ─────────────────────────────────────────────
+    t_dep = _time.perf_counter()
     if enriched_candidates:
         enriched_candidates = _expand_dependencies(
             session, dependency_engine, enriched_candidates, fault_type
         )
+    _timings["dependency_expansion"] = (_time.perf_counter() - t_dep) * 1000
 
-    # ── Update ConversationState with classification results ─────────────────
+    # ── Update ConversationState with classification results ──────────────────
     state = ConversationState(
         complaint_text  = corrected_text,
         is_sufficient   = True,
@@ -499,7 +599,8 @@ def process_complaint(
         suggested_resolution = reasoning.get("suggested_resolution"),
     )
 
-    # ── [11] SAVE INTAKE ─────────────────────────────────────────────────────
+    # ── [11] SAVE INTAKE ──────────────────────────────────────────────────────
+    t_db = _time.perf_counter()
     intake = _save_intake(
         session                = session,
         complaint_text         = corrected_text,
@@ -511,6 +612,9 @@ def process_complaint(
         complainant_rank       = complainant_rank,
         existing_intake_id     = existing_intake_id,
     )
+    _timings["db_save_intake"] = (_time.perf_counter() - t_db) * 1000
+
+    _log_timings(_timings, _time.perf_counter() - t_total_start)
 
     return PipelineResult(
         status              = "complete",

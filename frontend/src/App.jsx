@@ -12,6 +12,7 @@ import Registry from './pages/Registry';
 import TeamQueue from './pages/TeamQueue';
 import LoginPage from './pages/LoginPage';
 import TrackTicket from './pages/TrackTicket';
+import LiveCallContainer from './pages/LiveCallContainer';
 import { useCurrentUser } from './useCurrentUser';
 
 const AUTH_GUARD_ENABLED = true;
@@ -48,6 +49,7 @@ function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/track" element={<TrackTicket />} />
+            <Route path="/live-support" element={<LiveCallContainer />} />
             <Route path="*" element={<LoginPage />} />
           </Routes>
         </BrowserRouter>

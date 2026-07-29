@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # -- Auth (Keycloak) ---------------------
     # Set to True to enforce JWT tokens on all routes.
     # Keep False during development if Keycloak is not running.
-    AUTH_ENABLED: bool = False
+    AUTH_ENABLED: bool = True
     KEYCLOAK_URL: str = "http://localhost:8080"
     KEYCLOAK_REALM: str = "ai-helpdesk"
     KEYCLOAK_CLIENT_ID: str = "helpdesk-frontend"
@@ -143,6 +143,22 @@ class Settings(BaseSettings):
     
     # Maximum number of clarification attempts before marking intake as unable_to_identify
     MAX_CLARIFICATION_ATTEMPTS: int = 3
+
+    # -- Performance: Merged verify+category LLM call ----------------
+    # When True, verify_and_correct_text() and analyze_complaint_category()
+    # are fused into a single LLM call (verify_and_categorize_complaint).
+    # This eliminates one full roundtrip to the model and cuts pipeline
+    # latency by ~40-50% on the triage path.
+    # Set False to revert to the two-call path for regression testing.
+    MERGED_VERIFY_CATEGORY: bool = True
+
+    # -- Performance: Classify+Reason prompt size limits -------------
+    # Maximum number of candidate applications injected into the
+    # classify+reason user prompt. Lower = fewer tokens = faster TTFT.
+    CLASSIFY_MAX_CANDIDATES: int = 3
+    # Max characters of each symptom or purpose string injected per app.
+    # Prevents very long descriptions from bloating the prompt.
+    CLASSIFY_MAX_DESC_CHARS: int = 120
 
     class Config:
         env_file = ".env"

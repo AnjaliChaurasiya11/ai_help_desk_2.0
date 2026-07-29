@@ -46,6 +46,7 @@ STATIC_PROMPTS = {
     "heard_as":            "heard_as.wav",         # "I heard your service number as"
     "is_that_correct":     "is_that_correct.wav",  # "Is that correct?"
     "ask_another_complaint": "ask_another_complaint.wav",  # R-42: loop for a second ticket
+    "unable_to_identify":  "unable_to_identify.wav",       # Max clarification attempts exhausted
 }
 
 
@@ -180,6 +181,12 @@ FALLBACK_TEXT = {
     "confirm_yes_no": "Please say yes or no.",
     "processing": "Please wait. Your request is being processed.",
     "ask_another_complaint": "Do you have another complaint to report? Please say yes or no.",
+    # Shown / spoken when the system cannot identify the complaint after all clarification attempts.
+    # Keep this wording empathetic and action-oriented so the caller knows what happens next.
+    "unable_to_identify": (
+        "I was unable to identify your complaint after multiple attempts. "
+        "I am routing you to an operator who will assist you directly."
+    ),
 }
 
 
@@ -189,3 +196,126 @@ def get_prompt_text(key: str) -> str:
     WAV files are not available).
     """
     return FALLBACK_TEXT.get(key, "")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Live Call prompts — conversational, phone-call-friendly variants
+# Used exclusively by the LiveKit adapter path. The REST/web path
+# continues to use the templates above, keeping both paths independent.
+# ─────────────────────────────────────────────────────────────────────
+
+LIVE_CALL_FALLBACK_TEXT: dict = {
+    # Opening greeting — warm and brief
+    "greeting": (
+        "AI Help Desk. How can I assist you today?"
+    ),
+
+    # First thing asked after the greeting succeeds
+    "ask_service_number": (
+        "Please go ahead and tell me your service number."
+    ),
+
+    # After service number is confirmed — transition to complaint
+    "ask_complaint": (
+        "Got it. What's the issue you'd like to report?"
+    ),
+
+    # Couldn't catch a valid service number — try again
+    "retry_service": (
+        "Sorry, I didn't catch that. Could you repeat your service number?"
+    ),
+
+    # Max retries exceeded — routing away
+    "fallback_operator": (
+        "I'm having trouble verifying your service number. "
+        "I'll connect you to a support agent right away."
+    ),
+
+    # Call wrap-up
+    "goodbye": (
+        "Your ticket has been logged. Have a good day."
+    ),
+
+    # Unclear yes/no — ask again
+    "confirm_yes_no": (
+        "Sorry — could you just say yes or no?"
+    ),
+
+    # Processing hold
+    "processing": (
+        "One moment."
+    ),
+
+    # Ask another complaint loop
+    "ask_another_complaint": (
+        "Is there anything else you'd like to report?"
+    ),
+
+    # Could not identify complaint after all attempts
+    "unable_to_identify": (
+        "I'm having trouble understanding the issue. "
+        "I'll transfer you to a support agent who can help."
+    ),
+}
+
+LIVE_CALL_DYNAMIC_TEMPLATES: dict = {
+    # Read back the service number for confirmation
+    "confirm_service_number": (
+        "Just to confirm, I have your service number as {service_number} — is that right?"
+    ),
+
+    # Retry with attempt counter
+    "retry_service_number": (
+        "I didn't quite catch that. Could you repeat your service number? "
+        "That's attempt {attempt} of {max_attempts}."
+    ),
+
+    # Fallback to operator
+    "fallback_to_operator": (
+        "I wasn't able to verify your service number. "
+        "Connecting you to an agent now."
+    ),
+
+    # Classification result read-back — concise summary
+    "classification_summary": (
+        "Thanks. I've logged your issue as a {fault_type} complaint, "
+        "severity {severity}, under {application_name}. "
+        "Your ticket is being created now."
+    ),
+
+    # Guardrail rejection — couldn't understand the complaint
+    "complaint_rejected": (
+        "{reason} Could you describe the problem again?"
+    ),
+}
+
+
+def get_live_call_prompt(key: str) -> str:
+    """
+    Return the live-call-friendly text for a static prompt key.
+    Falls back to the standard FALLBACK_TEXT if the key is not
+    present in LIVE_CALL_FALLBACK_TEXT.
+    """
+    return LIVE_CALL_FALLBACK_TEXT.get(key) or FALLBACK_TEXT.get(key, "")
+
+
+def render_live_call_prompt(key: str, **kwargs) -> str:
+    """
+    Render a live-call dynamic template.
+    Falls back to render_dynamic_prompt() if the key is not in
+    LIVE_CALL_DYNAMIC_TEMPLATES, so the adapter never breaks on
+    an unknown key.
+    """
+    template = LIVE_CALL_DYNAMIC_TEMPLATES.get(key)
+    if template is None:
+        # Graceful fallback to the standard template
+        return render_dynamic_prompt(key, **kwargs)
+    try:
+        return template.format(**kwargs)
+    except KeyError as exc:
+        logger.error(
+            "Missing placeholder in live-call prompt '%s': %s  (provided: %s)",
+            key, exc, list(kwargs.keys()),
+        )
+        raise
+

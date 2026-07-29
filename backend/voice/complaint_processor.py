@@ -34,7 +34,7 @@ from sqlmodel import Session
 
 from models import Intake
 from voice.session import VoiceSessionManager, SessionState
-from voice.prompts import render_dynamic_prompt
+from voice.prompts import render_dynamic_prompt, render_live_call_prompt, get_live_call_prompt
 from services.pipeline import process_complaint
 from voice_schemas import VoiceCandidateApp
 
@@ -52,8 +52,10 @@ class ComplaintProcessingResult:
     prompt_text: str             # TTS/display response text
     corrected_transcript: str
     intake_id: Optional[int] = None
+    ticket_number: Optional[str] = None        # TIC-YYYYMM-XXXX — set when auto-created
     fault_type: Optional[str] = None
     severity: Optional[str] = None
+    application_name: Optional[str] = None     # Primary application display name
     candidates: List[VoiceCandidateApp] = field(default_factory=list)
     timings: dict = field(default_factory=dict)
 
@@ -132,10 +134,12 @@ def process_complaint_transcript(
 
     # ── GUARDRAIL REJECTION ──────────────────────────────────────────────────
     if result.status == "rejected":
-        reason = result.state.followup_question or "Complaint could not be understood."
+        reason = result.state.followup_question or "I wasn't able to understand that."
         return ComplaintProcessingResult(
             status               = "rejected",
-            prompt_text          = f"{reason} Please describe your IT issue again clearly.",
+            prompt_text          = render_live_call_prompt(
+                                       "complaint_rejected", reason=reason
+                                   ),
             corrected_transcript = raw_transcript,
             timings              = timings,
         )
@@ -156,8 +160,10 @@ def process_complaint_transcript(
     
     if result.status == "pending_clarification":
         next_state = SessionState.CAPTURING_COMPLAINT
-    else:
-        # For "complete" and "unable_to_identify", operator must review/submit
+    elif result.status == "unable_to_identify":
+        # Max clarification attempts exhausted — route to operator for manual handling.
+        next_state = SessionState.OPERATOR_REVIEW
+    else:  # "complete"
         next_state = SessionState.OPERATOR_REVIEW
 
     current_state = voice_session.state if voice_session else None
@@ -191,18 +197,72 @@ def process_complaint_transcript(
     t_tts_start = time.time()
     state = result.state
 
+    # Initialise here so they are always defined regardless of which branch runs
+    ticket_number: Optional[str] = None
+    app_name: Optional[str] = None
+
     if state.needs_followup and state.followup_question:
-        # Override TTS prompt with the follow-up question
+
+        # Incomplete complaint — speak the follow-up question
         prompt_text = state.followup_question
         logger.info(
             "[voice.CP] Follow-up triggered (reason=%s, confidence=%.2f) — "
             "overriding TTS prompt.",
             state.followup_reason, state.confidence,
         )
+    elif result.status == "unable_to_identify":
+        # Three clarification attempts exhausted — inform the caller and route to operator
+        prompt_text = get_live_call_prompt("unable_to_identify")
+        logger.info(
+            "[voice.CP] unable_to_identify after %d attempts — operator fallback TTS.",
+            result.clarification_attempts,
+        )
     else:
-        # Generate summary prompt from classification results
+        # Complete classification — auto-create ticket and read back a brief confirmation
         app_name = voice_candidates[0].application_name if voice_candidates else "Unknown"
-        prompt_text = render_dynamic_prompt(
+        primary_app_id = voice_candidates[0].application_id if voice_candidates else None
+
+        # ── Auto-create the Ticket so the summary shows a real TIC-YYYYMM-XXXX ──
+        try:
+            from routers.tickets import _generate_ticket_number
+            from models import Ticket, TicketHistory
+            from sqlalchemy import text as sa_text
+
+            intake_obj = db_session.get(Intake, result.intake_id) if result.intake_id else None
+            if intake_obj and primary_app_id:
+                ticket_number = _generate_ticket_number(db_session)
+                ticket = Ticket(
+                    ticket_number=ticket_number,
+                    intake_id=intake_obj.id,
+                    primary_application_id=primary_app_id,
+                    status="open",
+                    fault_type=result.fault_type,
+                    severity=result.severity,
+                    complainant_service_no=intake_obj.complainant_service_no,
+                    complainant_rank=intake_obj.complainant_rank,
+                    complainant_unit=intake_obj.complainant_unit,
+                    assignee_id=None,
+                    created_by_service_no=complainant_service_no or "voice-agent",
+                )
+                db_session.add(ticket)
+                history = TicketHistory(
+                    ticket_number=ticket_number,
+                    changed_by="voice-agent",
+                    old_status="",
+                    new_status="open",
+                    notes="Ticket auto-created by Live AI Support voice call.",
+                )
+                db_session.add(history)
+                db_session.commit()
+                logger.info(
+                    "[voice.CP] Auto-created ticket %s for intake_id=%s",
+                    ticket_number, result.intake_id,
+                )
+        except Exception as tc_exc:
+            logger.error("[voice.CP] Failed to auto-create ticket: %s", tc_exc, exc_info=True)
+            # Non-fatal: ticket_number stays None; summary will show intake ID as fallback
+
+        prompt_text = render_live_call_prompt(
             "classification_summary",
             complaint_text   = result.corrected_text[:100],
             application_name = app_name,
@@ -218,8 +278,10 @@ def process_complaint_transcript(
         prompt_text          = prompt_text,
         corrected_transcript = result.corrected_text,
         intake_id            = result.intake_id,
+        ticket_number        = ticket_number if result.status not in ("rejected", "unable_to_identify", "pending_clarification") else None,
         fault_type           = result.fault_type,
         severity             = result.severity,
+        application_name     = app_name if result.status not in ("rejected", "unable_to_identify", "pending_clarification") else None,
         candidates           = voice_candidates,
         timings              = timings,
         confidence           = state.confidence,

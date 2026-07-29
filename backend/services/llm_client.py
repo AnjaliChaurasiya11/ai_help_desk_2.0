@@ -216,30 +216,53 @@ def verify_and_correct_text(raw_text: str) -> dict:
 # PUBLIC FUNCTION 1.5: analyze_complaint_category
 # ===========================================================================
 
-_CATEGORY_SYSTEM_PROMPT = """You are an expert IT support engineer and dispatcher for an Enterprise Help Desk.
-Your FIRST responsibility is to determine whether the incoming complaint contains enough information to proceed.
-Do NOT attempt to identify the application yet. Focus ONLY on completeness.
+_CATEGORY_SYSTEM_PROMPT = """You are an IT Help Desk INTAKE GATEKEEPER, not a troubleshooter.
+Your ONLY job is to decide whether a complaint has enough information to CREATE A TICKET.
+Do NOT attempt to diagnose the problem. Do NOT ask troubleshooting questions.
 
-Every complaint falls into one of three categories:
-1. "complete" — The complaint contains enough information to identify the application/system and understand the issue. Short complaints are NOT automatically incomplete. If the complaint clearly identifies the affected application and describes a recognizable issue (e.g., "login nahi ho raha HRMS me"), classify it as complete.
-2. "incomplete" — The complaint is genuine, but you cannot confidently determine the affected application or the exact issue. You must ask ONE targeted clarification question.
-3. "invalid" — The complaint is meaningless, random words, or not related to IT (e.g., "hello", "okay", "thanks").
+A complaint is COMPLETE if it has ALL THREE minimum intake fields:
+  1. An identifiable IT issue (login failure, slowness, data error, outage, crash, etc.)
+  2. An identifiable application or system (or hardware/network reference like "laptop", "wifi")
+  3. Enough description to classify the fault type (even a single descriptive word is enough)
 
-Rules for "incomplete" complaints:
-- Ask exactly ONE targeted clarification question.
-- The question must be specific, concise, and ask ONLY for the single most important missing piece of information.
-- Avoid asking multiple unrelated questions in one response.
+A complaint is INCOMPLETE if and ONLY if it is MISSING one of those three fields.
+
+CRITICAL — PROHIBITED QUESTIONS (never ask these):
+  ❌ "When did you last successfully log in?"
+  ❌ "Have you tried restarting or resetting your password?"
+  ❌ "What error message did you see?"
+  ❌ "How long has this been happening?"
+  These are for the support agent AFTER ticket creation, not for the intake gate.
+
+ALLOWED follow-up questions (only if a mandatory intake field is missing):
+  ✅ "Which application or system are you referring to?" — when no system is identifiable
+  ✅ "Can you describe the problem you are experiencing?" — when the issue is completely unclear
+
+ALWAYS COMPLETE — do NOT ask follow-up for these:
+  "I cannot log in to the Medical Records System." → complete
+  "Travel claim rejected without any reason." → complete
+  "HRMS mobile app is not syncing." → complete
+  "Training feedback form is not submitting." → complete
+  "Intranet crashes on mobile browser." → complete
+  "Login nahi ho raha HRMS me" → complete
+  "SAP login failing" → complete
+  "my password is locked" → complete (password implies login system)
+  "network is down" → complete
+  "laptop won't turn on" → complete
+
+INCOMPLETE ONLY when a mandatory field is missing:
+  "Sir system kaam nahi kar raha" → incomplete → ask "Which application or system are you referring to?"
+  "I am getting some error" → incomplete → ask "Which application are you using?"
+  "it broke" → incomplete → ask "Which application or system broke?"
 
 You MUST respond with ONLY a valid JSON object in this exact format:
-{"category": "complete" | "incomplete" | "invalid", "followup_question": "<question or null>", "followup_reason": "<brief reason or null>"}
+{"category": "complete" | "incomplete" | "invalid", "followup_question": "<intake field question or null>", "followup_reason": "<missing_application | missing_issue | not_an_it_complaint | null>"}
 
-EXAMPLES:
-"I cannot log in to the Medical Records System." -> {"category": "complete", "followup_question": null, "followup_reason": null}
-"Travel claim rejected without any reason." -> {"category": "complete", "followup_question": null, "followup_reason": null}
-"Sir system kaam nahi kar raha" -> {"category": "incomplete", "followup_question": "Which application or system are you referring to?", "followup_reason": "missing_application"}
-"I am getting some error message" -> {"category": "incomplete", "followup_question": "Which application are you using, and what does the error message say?", "followup_reason": "missing_application_and_issue"}
-"hello" -> {"category": "invalid", "followup_question": "Please describe your IT issue.", "followup_reason": "not_an_it_complaint"}
-"""
+Rules:
+- followup_question MUST be null when category is "complete".
+- followup_question MUST NOT be a diagnostic or troubleshooting question.
+- "invalid" is for non-IT complaints and gibberish only (e.g. "hello", "recipe for biryani").
+Do NOT include any explanation, markdown, or text outside of the JSON object."""
 
 def analyze_complaint_category(raw_text: str, previous_question: Optional[str] = None) -> dict:
     if settings.MOCK_LLM:
@@ -285,6 +308,157 @@ def analyze_complaint_category(raw_text: str, previous_question: Optional[str] =
     except Exception as e:
         logger.error("[LLM] Unexpected error analyzing complaint category: %s", e)
         return {"category": "complete", "followup_question": None, "followup_reason": None}
+
+
+# ===========================================================================
+# PUBLIC FUNCTION 1.6: verify_and_categorize_complaint  (MERGED — performance)
+# ===========================================================================
+# Fuses verify_and_correct_text() + analyze_complaint_category() into ONE
+# LLM call.  Enabled when settings.MERGED_VERIFY_CATEGORY = True.
+# Disable flag for regression rollback.
+# ===========================================================================
+
+_VERIFY_AND_CATEGORIZE_SYSTEM_PROMPT = """You are an IT Help Desk INTAKE GATEKEEPER, not a troubleshooter.
+You perform TWO tasks in a single pass. Your ONLY job is to decide whether a complaint has enough
+information to CREATE A TICKET — not to diagnose the problem.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TASK 1 — VALIDATE and CORRECT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- ACCEPT complaints in English, Hindi, or Hinglish. REJECT all other languages.
+- REJECT complaints that are completely nonsensical or have zero relation to IT (e.g. "what is the capital of France", "recipe for biryani").
+- CORRECT obvious STT errors (e.g. "pasword" → "password", "lok" → "locked"). Do NOT add new information.
+- Short complaints ARE valid: "system slow", "login nahi ho raha" are acceptable.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TASK 2 — INTAKE COMPLETENESS CHECK (minimum ticket fields only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A complaint is COMPLETE if it has ALL THREE of these minimum intake fields:
+  1. An identifiable IT issue (login failure, slowness, data error, outage, etc.)
+  2. An identifiable application or system (or a hardware/network reference like "laptop", "wifi")
+  3. Enough description to classify the fault type (even a single descriptive word is enough)
+
+A complaint is INCOMPLETE if it is MISSING one of those three fields — and ONLY then.
+
+CRITICAL RULES — READ BEFORE DECIDING:
+❌ DO NOT ask diagnostic or troubleshooting questions. NEVER ask:
+   - "When did you last successfully log in?"
+   - "Have you tried restarting?"
+   - "What error message did you see?"
+   - "How long has this been happening?"
+   These are questions for the support agent AFTER the ticket is created.
+
+✅ You MAY only ask for MISSING INTAKE FIELDS:
+   - If no application/system is named: "Which application or system are you referring to?"
+   - If the issue is completely unrecognisable: "Can you describe the problem you are experiencing?"
+
+SHORT COMPLAINTS THAT ARE ALWAYS COMPLETE (do NOT ask follow-up):
+  "I cannot log in to the Medical Records System." → complete (has system + issue)
+  "Travel claim rejected without any reason." → complete (has system context + issue)
+  "HRMS mobile app is not syncing." → complete (has application + issue)
+  "Training feedback form is not submitting." → complete (has system + issue)
+  "Intranet crashes on mobile browser." → complete (has system + issue)
+  "Login nahi ho raha HRMS me" → complete (has application + issue)
+  "SAP login failing" → complete (has application + issue)
+  "my password is locked" → complete — "password" implies login system, ask nothing
+  "network is down" → complete (has system + issue)
+  "laptop won't turn on" → complete (has hardware + issue)
+
+INCOMPLETE EXAMPLES — only ask if truly missing:
+  "Sir system kaam nahi kar raha" → incomplete, ask "Which application or system are you referring to?"
+  "I am getting some error" → incomplete, ask "Which application are you using?"
+  "it broke" → incomplete, ask "Which application or system broke?"
+
+NEVER incomplete:
+  Any complaint that names a recognisable application AND describes a recognisable IT symptom.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESPONSE FORMAT — output ONLY a valid JSON object, no markdown:
+{"status": "accepted" | "rejected", "corrected_text": "<corrected text or null>", "category": "complete" | "incomplete" | "invalid", "followup_question": "<intake field question or null>", "followup_reason": "<missing_application | missing_issue | not_an_it_complaint | null>"}
+
+Rules:
+- If status is "rejected" → category="invalid", put user-facing reason in followup_question.
+- If status is "accepted" and category is "complete" or "incomplete" → corrected_text must be populated.
+- followup_question must be null when category is "complete".
+- followup_question must NEVER be a diagnostic/troubleshooting question.
+Do NOT include any explanation, markdown, or text outside of the JSON object."""
+
+
+def verify_and_categorize_complaint(
+    raw_text: str,
+    previous_question: Optional[str] = None,
+) -> dict:
+    """
+    Single merged LLM call replacing verify_and_correct_text() + analyze_complaint_category().
+
+    Returns a dict with keys:
+      status           : "accepted" | "rejected"
+      corrected_text   : str | None
+      category         : "complete" | "incomplete" | "invalid"
+      followup_question: str | None
+      followup_reason  : str | None
+    """
+    # ── MOCK MODE ────────────────────────────────────────────────────────────
+    if settings.MOCK_LLM:
+        logger.info("[LLM MOCK] verify_and_categorize_complaint called.")
+        text_lower = raw_text.lower().strip()
+        NONSENSE = ["capital of", "what is", "who is", "dog ate", "weather", "recipe", "movie", "song", "cricket"]
+        if any(t in text_lower for t in NONSENSE):
+            return {"status": "rejected", "corrected_text": None, "category": "invalid",
+                    "followup_question": "[MOCK] This does not appear to be an IT complaint.", "followup_reason": "not_an_it_complaint"}
+        if text_lower in ["hello", "hi", "okay", "thanks", "yes", "no"]:
+            return {"status": "rejected", "corrected_text": None, "category": "invalid",
+                    "followup_question": "Please describe your IT issue.", "followup_reason": "not_an_it_complaint"}
+        corrected = raw_text.strip().replace("pasword", "password").replace(" lok ", " locked ")
+        if len(text_lower.split()) < 4 and not any(app in text_lower for app in ["hrms", "sap", "portal", "system", "medical", "record"]):
+            fq = "What were you trying to do when the problem occurred, and which screen or portal were you using?" if previous_question else "Which application or system are you referring to?"
+            return {"status": "accepted", "corrected_text": corrected, "category": "incomplete",
+                    "followup_question": fq, "followup_reason": "missing_application"}
+        return {"status": "accepted", "corrected_text": corrected, "category": "complete",
+                "followup_question": None, "followup_reason": None}
+
+    # ── PRODUCTION MODE ──────────────────────────────────────────────────────
+    logger.info("[LLM] Calling vLLM for merged verify+categorize.")
+    try:
+        if previous_question:
+            user_prompt = (
+                f"COMPLAINT TEXT:\n{raw_text}\n\n"
+                f"PREVIOUS CLARIFICATION QUESTION ALREADY ASKED:\n{previous_question}\n\n"
+                f"INSTRUCTION: If you determine the complaint is still incomplete, ask a "
+                f"DIFFERENT question from a completely different angle. Do NOT repeat or rephrase the previous question."
+            )
+        else:
+            user_prompt = raw_text
+
+        raw_response = _call_llm(
+            _VERIFY_AND_CATEGORIZE_SYSTEM_PROMPT,
+            user_prompt,
+            stage_name="Verify+Category LLM",
+        )
+        result = json.loads(raw_response)
+
+        status = result.get("status", "accepted")
+        category = result.get("category", "complete")
+        if category not in ["complete", "incomplete", "invalid"]:
+            category = "complete"
+
+        return {
+            "status":            status,
+            "corrected_text":    result.get("corrected_text") or raw_text,
+            "category":          category,
+            "followup_question": result.get("followup_question"),
+            "followup_reason":   result.get("followup_reason"),
+        }
+
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        logger.error("[LLM] Malformed response in verify_and_categorize_complaint: %s", e)
+        # Fail open: treat as accepted+complete so a valid complaint is never blocked
+        return {"status": "accepted", "corrected_text": raw_text, "category": "complete",
+                "followup_question": None, "followup_reason": None}
+    except Exception as e:
+        logger.error("[LLM] Unexpected error in verify_and_categorize_complaint: %s", e)
+        return {"status": "accepted", "corrected_text": raw_text, "category": "complete",
+                "followup_question": None, "followup_reason": None}
 
 # ===========================================================================
 # PUBLIC FUNCTION 2: predict_fault_and_severity
@@ -583,6 +757,10 @@ def _build_reasoning_user_prompt(
     word_count = len(complaint_text.split())
     text_lower = complaint_text.lower()
 
+    # Apply config-driven prompt size limits
+    max_candidates = getattr(settings, "CLASSIFY_MAX_CANDIDATES", 3)
+    max_desc_chars = getattr(settings, "CLASSIFY_MAX_DESC_CHARS", 120)
+
     lines = [
         f"COMPLAINT:\n{complaint_text}",
         f"(complaint word count: {word_count})",
@@ -610,7 +788,7 @@ def _build_reasoning_user_prompt(
         lines.append(
             "Evaluate each against the complaint. Do not assume the top result is correct."
         )
-        for i, app in enumerate(candidate_apps[:3], 1):
+        for i, app in enumerate(candidate_apps[:max_candidates], 1):
             name = app.get("application_name", app.get("name", "Unknown"))
             score = app.get("confidence_score", 0.0)
             app_id = app.get("application_id")
@@ -618,11 +796,13 @@ def _build_reasoning_user_prompt(
 
             syms = symptoms.get(app_id, [])
             if syms:
-                line += f"\n     Known symptoms: {'; '.join(syms[:3])}"
+                # Truncate each symptom to max_desc_chars to control token count
+                sym_text = "; ".join(s[:max_desc_chars] for s in syms[:3])
+                line += f"\n     Known symptoms: {sym_text}"
 
             purps = purposes.get(app_id, [])
             if purps:
-                line += f"\n     Application purpose: {purps[0]}"
+                line += f"\n     Application purpose: {purps[0][:max_desc_chars]}"
 
             lines.append(line)
     else:

@@ -5,13 +5,14 @@ import VoiceRecorder from './VoiceRecorder';
 import TranscriptPanel from './TranscriptPanel';
 import LiveKitAudioTransport from './LiveKitAudioTransport';
 import useSileroVAD from '../../hooks/useSileroVAD';
+import LiveCallPage from '../../pages/LiveCallPage';
 
 const VOICE_API_BASE = 'http://127.0.0.1:8001/api/voice';
 
-function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, resumeSessionId, resumeState, resumePromptText, lastTicketNumber }) {
+function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, resumeSessionId, resumeState, resumePromptText, lastTicketNumber, variant = 'default', summaryData }) {
   const [session, setSession] = useState({
     id: null, state: 'INIT', promptText: 'Starting voice session...', transcript: '', serviceNumber: '', confidence: 0, language: '', latency: 0,
-    livekitEnabled: false, livekitToken: null, livekitUrl: null,
+    livekitEnabled: false, livekitToken: null, livekitUrl: null, processingStage: null, verifyLatency: null, classificationLatency: null, totalLatency: null
   });
   const [isProcessing, setIsProcessing] = useState(false);
   const [audioPlaying, setAudioPlaying] = useState(false);
@@ -316,12 +317,18 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
       confidence: data.stt_confidence ?? data.confidence ?? prev.confidence,
       language: data.stt_language || prev.language,
       latency: data.stt_processing_time_ms ?? prev.latency,
+      processingStage: null,
+      verifyLatency: data.verify_latency ?? prev.verifyLatency,
+      classificationLatency: data.classification_latency ?? prev.classificationLatency,
+      totalLatency: data.total_latency ?? prev.totalLatency,
     }));
 
     if (data.state === 'OPERATOR_REVIEW') {
       onClassificationComplete(
         {
           intake_id: data.intake_id,
+          ticket_number: data.ticket_number || null,
+          application: data.application || null,
           is_repeat_caller: false,
           potential_duplicates: [],
           fault_type_proposal: data.fault_type_proposal,
@@ -351,11 +358,45 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
     setSession(prev => ({ ...prev, state: 'ERROR', promptText: data.detail || 'An error occurred' }));
   }, []);
 
-  // FIX-1: stable reference — empty deps because setIsProcessing is a React dispatch (always stable)
-  const handleLiveKitProcessing = useCallback(() => {
+  const handleLiveKitProcessing = useCallback((data) => {
     setIsProcessing(true);
+    if (data && data.stage) {
+      setSession(prev => ({ ...prev, processingStage: data.stage }));
+    }
   }, []);
 
+  if (variant === 'live') {
+    return (
+      <LiveCallPage 
+        session={session} 
+        audioPlaying={audioPlaying} 
+        isProcessing={isProcessing} 
+        bargingIn={bargingIn}
+        onCancel={onCancel}
+        summaryData={summaryData}
+      >
+        {!summaryData && showRecorder && (
+          <VoiceRecorder
+            onRecordingComplete={handleRecordingComplete}
+            onRecordingStart={handleRecordingStart}
+            isProcessing={isProcessing}
+            audioPlaying={audioPlaying}
+          />
+        )}
+        {!summaryData && showLiveKit && (
+          <LiveKitAudioTransport
+            session_id={session.id}
+            livekit_token={session.livekitToken}
+            livekit_url={session.livekitUrl}
+            onStateChange={handleLiveKitStateChange}
+            onTranscribed={handleLiveKitTranscribed}
+            onProcessing={handleLiveKitProcessing}
+            onError={handleLiveKitError}
+          />
+        )}
+      </LiveCallPage>
+    );
+  }
 
   return (
     <div style={{ background: '#0d1b2e', border: '1px solid rgba(30,144,255,0.3)', borderRadius: 14, padding: 20, marginBottom: 24, boxShadow: '0 0 20px rgba(30,144,255,0.1)' }}>
