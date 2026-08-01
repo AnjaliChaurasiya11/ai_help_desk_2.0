@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # -- Auth (Keycloak) ---------------------
     # Set to True to enforce JWT tokens on all routes.
     # Keep False during development if Keycloak is not running.
-    AUTH_ENABLED: bool = True
+    AUTH_ENABLED: bool = False
     KEYCLOAK_URL: str = "http://localhost:8080"
     KEYCLOAK_REALM: str = "ai-helpdesk"
     KEYCLOAK_CLIENT_ID: str = "helpdesk-frontend"

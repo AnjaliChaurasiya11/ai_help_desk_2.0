@@ -135,6 +135,7 @@ class CandidateApp(BaseModel):
     """
     application_id: int
     application_name: str
+    owning_team: str = ""
     confidence_score: float = Field(..., ge=0.0, le=1.0)
     is_primary: bool = False
     expansion_reason: Optional[str] = Field(
@@ -222,6 +223,10 @@ class TicketConfirmRequest(BaseModel):
         description="If this ticket originated from a voice call, the voice session ID "
                     "(R-42) so the call's FSM can advance to ASK_ANOTHER_COMPLAINT.",
     )
+    assigned_team: Optional[str] = Field(
+        default=None,
+        description="The team assigned to handle the ticket (e.g., 'Network Team')."
+    )
 
 
     # What the AI originally predicted (for learning loop comparison)
@@ -265,6 +270,7 @@ class TicketResponse(BaseModel):
     fault_type: str
     severity: str
     assignee_id: Optional[str] = None
+    assigned_team: Optional[str] = None
     dependencies: List[dict] = Field(default_factory=list)
     created_at: Optional[datetime] = None
 
@@ -306,6 +312,7 @@ class TicketUpdateRequest(BaseModel):
     )
     changed_by: str = Field(default="system", examples=["OP-001"])
     assignee_id: Optional[str] = Field(default=None, examples=["12345P"], description="Service number of the operator taking ownership")
+    assigned_team: Optional[str] = Field(default=None, examples=["Network Team"], description="The team assigned to handle the ticket")
 
 
 class TicketUpdateResponse(BaseModel):
@@ -363,6 +370,7 @@ class TicketConfirmItem(BaseModel):
     predicted_app_id: Optional[int] = None
     predicted_fault_type: Optional[str] = None
     predicted_severity: Optional[str] = None
+    assigned_team: Optional[str] = None
 
 
 class MultiTicketConfirmRequest(BaseModel):

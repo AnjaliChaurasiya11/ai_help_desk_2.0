@@ -55,6 +55,7 @@ from schemas import (
 from services.embedder import TextEmbedder
 from services.dependencies import ApplicationDependencyEngine
 from services.pipeline import process_complaint
+from services.ticket_service import create_ticket
 
 import logging
 from voice.session import session_manager
@@ -72,48 +73,8 @@ router = APIRouter()
 
 
 # =====================================================================
-# HELPER: Generate Ticket Number — TIC-YYYYMM-XXXX
+# Ticket Number generation moved to services.ticket_service
 # =====================================================================
-
-def _generate_ticket_number(session: Session) -> str:
-    """
-    Generates the next sequential ticket number in the format TIC-YYYYMM-XXXX.
-
-    Race-condition safety:
-      Acquires a PostgreSQL transaction-level advisory lock before reading the
-      current MAX so that concurrent requests are serialized — each waits for
-      the previous one to commit before proceeding. The lock is automatically
-      released when the enclosing transaction commits or rolls back; no manual
-      cleanup is needed.
-
-      Advisory lock key 7483921 is an arbitrary constant chosen to be unique
-      to this operation. It does not collide with any other lock in the app.
-    """
-    now = dt_lib.datetime.now(timezone.utc)
-    prefix = f"TIC-{now.strftime('%Y%m')}-"
-
-    # Serialize concurrent ticket-number generation. pg_advisory_xact_lock
-    # blocks until it can acquire the lock exclusively, then holds it for the
-    # duration of the current transaction. This turns the read-then-increment
-    # into an atomic operation across concurrent workers.
-    session.execute(text("SELECT pg_advisory_xact_lock(7483921)"))
-
-    # Find the highest ticket number for this month
-    statement = (
-        select(Ticket.ticket_number)
-        .where(col(Ticket.ticket_number).startswith(prefix))
-        .order_by(col(Ticket.ticket_number).desc())
-    )
-    result = session.exec(statement).first()
-
-    if result:
-        # Extract the sequence number and increment
-        last_seq = int(result.split("-")[-1])
-        next_seq = last_seq + 1
-    else:
-        next_seq = 1
-
-    return f"{prefix}{next_seq:04d}"
 
 
 # =====================================================================
@@ -312,129 +273,27 @@ def confirm_ticket(
         if not app:
             raise HTTPException(status_code=404, detail=f"Application ID {request.confirmed_app_id} not found.")
 
-    ticket_status = "open" if app else "triage"
-
-    # Look up the intake record
-    intake = session.get(Intake, request.intake_id)
-    if not intake:
-        raise HTTPException(status_code=404, detail=f"Intake ID {request.intake_id} not found.")
-
     # -----------------------------------------------------------------
-    # Generate ticket number: TIC-YYYYMM-XXXX
+    # Create ticket via shared service
     # -----------------------------------------------------------------
-    ticket_number = _generate_ticket_number(session)
-
-    # -----------------------------------------------------------------
-    # R-14: Insert into tickets table
-    # -----------------------------------------------------------------
-    ticket = Ticket(
-        ticket_number=ticket_number,
-        intake_id=intake.id,
-        primary_application_id=request.confirmed_app_id,
-        status=ticket_status,
-        fault_type=request.confirmed_fault_type,
-        severity=request.confirmed_severity,
-        complainant_service_no=intake.complainant_service_no,
-        complainant_rank=intake.complainant_rank,
-        complainant_unit=intake.complainant_unit,
-        assignee_id=None,
-        created_by_service_no=current_user.service_no,
-    )
-    session.add(ticket)
-    session.flush()  # Force INSERT into tickets table so foreign keys pass
-
-    # -----------------------------------------------------------------
-    # R-15: Insert related applications into junction table
-    # -----------------------------------------------------------------
-    for related_id in request.related_app_ids:
-        if related_id != request.confirmed_app_id:  # Don't duplicate primary
-            related_app = session.get(Application, related_id)
-            if related_app:
-                rel = TicketRelatedApp(
-                    ticket_number=ticket_number,
-                    related_application_id=related_id,
-                )
-                session.add(rel)
-
-    # -----------------------------------------------------------------
-    # R-22: Save to learning_examples (prediction vs confirmed)
-    # This feeds the AI learning loop.
-    # -----------------------------------------------------------------
-    final_text = request.edited_raw_text if request.edited_raw_text else intake.raw_text
-    
-    if request.edited_raw_text and request.edited_raw_text != intake.raw_text:
-        intake.raw_text = request.edited_raw_text
-        session.add(intake)
-        
-    embedding = embedder.get_embedding(final_text)
-    learning_entry = LearningExample(
-        ticket_number=ticket_number,
-        raw_text=final_text,
-        text_embedding=embedding,
-        predicted_app_id=request.predicted_app_id,
+    response_data = create_ticket(
+        session=session,
+        intake_id=request.intake_id,
         confirmed_app_id=request.confirmed_app_id,
-        predicted_fault_type=request.predicted_fault_type,
+        related_app_ids=request.related_app_ids,
         confirmed_fault_type=request.confirmed_fault_type,
-        predicted_severity=request.predicted_severity,
         confirmed_severity=request.confirmed_severity,
+        operator_notes=request.operator_notes,
+        predicted_app_id=request.predicted_app_id,
+        predicted_fault_type=request.predicted_fault_type,
+        predicted_severity=request.predicted_severity,
+        created_by_service_no=current_user.service_no,
+        edited_raw_text=request.edited_raw_text,
+        voice_session_id=request.voice_session_id,
+        assigned_team=request.assigned_team,
     )
-    session.add(learning_entry)
 
-    # -----------------------------------------------------------------
-    # R-16: Route to the owning team (stored in response for frontend)
-    # No application confirmed -> no team to route to, stays in triage.
-    # -----------------------------------------------------------------
-    routed_to = app.owning_team if app else "Unassigned"
-
-    # -----------------------------------------------------------------
-    # Log initial ticket history entry
-    # -----------------------------------------------------------------
-    base_note = f"Ticket created. Routed to {routed_to}." if app else \
-        "Ticket created. No matching application — sent to triage."
-    history = TicketHistory(
-        ticket_number=ticket_number,
-        changed_by="system",
-        old_status="",
-        new_status=ticket_status,
-        notes=f"{base_note} Operator notes: {request.operator_notes}" if request.operator_notes else base_note,
-    )
-    session.add(history)
-
-    # Commit everything in one transaction
-    session.commit()
-
-    # R-42: if this ticket came from a voice call, advance the call's FSM
-    # so the caller can be asked about another complaint. Best-effort —
-    # the ticket itself is already committed, so a missing/expired voice
-    # session must never fail this response.
-    voice_next_state = None
-    voice_prompt_text = None
-    if request.voice_session_id:
-        try:
-            session_manager.complete_ticket_and_ask_again(
-                request.voice_session_id, ticket_number,
-            )
-            voice_next_state = "ASK_ANOTHER_COMPLAINT"
-            voice_prompt_text = get_prompt_text("ask_another_complaint")
-        except ValueError as exc:
-            logger.warning(
-                "Could not advance voice session %s to ASK_ANOTHER_COMPLAINT: %s",
-                request.voice_session_id, exc,
-            )
-
-    return TicketConfirmResponse(
-        ticket_number=ticket_number,
-        status=ticket_status,
-        primary_application_name=app.name if app else "Unclassified",
-        fault_type=request.confirmed_fault_type,
-        severity=request.confirmed_severity,
-        routed_to_team=routed_to,
-        message=f"Ticket {ticket_number} created and routed to {routed_to}." if app else
-                f"Ticket {ticket_number} created and sent to triage (no matching application).",
-        voice_session_id=request.voice_session_id if voice_next_state else None,
-        voice_next_state=voice_next_state,
-        voice_prompt_text=voice_prompt_text,
-    )
+    return TicketConfirmResponse(**response_data)
 
 
 # =====================================================================
@@ -567,6 +426,7 @@ def list_tickets(
                 fault_type=t.fault_type or "",
                 severity=t.severity or "",
                 assignee_id=t.assignee_id,
+                assigned_team=t.assigned_team,
                 dependencies=deps,
                 created_at=t.created_at,
             )
@@ -673,6 +533,7 @@ def track_ticket(
         fault_type=ticket.fault_type or "",
         severity=ticket.severity or "",
         assignee_id=ticket.assignee_id,
+        assigned_team=ticket.assigned_team,
         dependencies=[], # Keeping it simple for public view
         created_at=ticket.created_at,
     )
@@ -737,12 +598,16 @@ def update_ticket(
     # Save old status for audit trail
     # -----------------------------------------------------------------
     old_status = ticket.status
+    old_assigned_team = ticket.assigned_team
 
     # -----------------------------------------------------------------
     # R-19: Apply assignee if provided
     # -----------------------------------------------------------------
     if request.assignee_id is not None:
         ticket.assignee_id = request.assignee_id
+        
+    if request.assigned_team is not None:
+        ticket.assigned_team = request.assigned_team
 
     # -----------------------------------------------------------------
     # Update the ticket status
@@ -760,12 +625,17 @@ def update_ticket(
     # -----------------------------------------------------------------
     # Log the status change into ticket_history
     # -----------------------------------------------------------------
+    final_notes = request.notes
+    if request.assigned_team is not None and request.assigned_team != old_assigned_team:
+        team_change_msg = f"Reassigned from {old_assigned_team or 'Unassigned'} to {request.assigned_team}."
+        final_notes = f"{team_change_msg} {request.notes}".strip()
+
     history_entry = TicketHistory(
         ticket_number=ticket_number,
         changed_by=request.changed_by,
         old_status=old_status,
         new_status=request.new_status,
-        notes=request.notes,
+        notes=final_notes,
         resolution_embedding=resolution_embedding,
     )
     session.add(history_entry)
@@ -924,51 +794,28 @@ def confirm_multi_ticket(
         if not app:
             raise HTTPException(status_code=404, detail=f"Application {item.confirmed_app_id} not found.")
 
-        ticket_number = _generate_ticket_number(session)
-        ticket = Ticket(
-            ticket_number=ticket_number,
-            intake_id=intake.id,
-            primary_application_id=item.confirmed_app_id,
-            status="open",
-            fault_type=item.confirmed_fault_type,
-            severity=item.confirmed_severity,
-            complainant_service_no=intake.complainant_service_no,
-            complainant_rank=intake.complainant_rank,
-            complainant_unit=intake.complainant_unit,
-            assignee_id=None,
-            created_by_service_no=current_user.service_no,
-        )
-        session.add(ticket)
-        session.flush()
-
-        for related_id in item.related_app_ids:
-            if related_id != item.confirmed_app_id:
-                rel_app = session.get(Application, related_id)
-                if rel_app:
-                    session.add(TicketRelatedApp(ticket_number=ticket_number, related_application_id=related_id))
-
-        learning_entry = LearningExample(
-            ticket_number=ticket_number,
-            raw_text=intake.raw_text,
-            text_embedding=embedding,
-            predicted_app_id=item.predicted_app_id,
+        # -----------------------------------------------------------------
+        # Create ticket via shared service
+        # -----------------------------------------------------------------
+        response_data = create_ticket(
+            session=session,
+            intake_id=request.intake_id,
             confirmed_app_id=item.confirmed_app_id,
-            predicted_fault_type=item.predicted_fault_type,
+            related_app_ids=item.related_app_ids,
             confirmed_fault_type=item.confirmed_fault_type,
-            predicted_severity=item.predicted_severity,
             confirmed_severity=item.confirmed_severity,
+            operator_notes=item.operator_notes,
+            predicted_app_id=item.predicted_app_id,
+            predicted_fault_type=item.predicted_fault_type,
+            predicted_severity=item.predicted_severity,
+            created_by_service_no=current_user.service_no,
+            edited_raw_text=item.edited_raw_text,
+            voice_session_id=None,  # Not applicable for multi-ticket
+            assigned_team=item.assigned_team,
         )
-        session.add(learning_entry)
 
-        history = TicketHistory(
-            ticket_number=ticket_number,
-            changed_by="system",
-            old_status="",
-            new_status="open",
-            notes=f"Ticket created (multi-fault). Routed to {app.owning_team}."
-                  + (f" Notes: {item.operator_notes}" if item.operator_notes else ""),
-        )
-        session.add(history)
+        ticket_number = response_data["ticket_number"]
+        routed_to = response_data["routed_to_team"]
 
         created.append(TicketConfirmResponse(
             ticket_number=ticket_number,

@@ -95,6 +95,13 @@ function CallSummaryScreen({ summaryData, onRestart }) {
             </div>
           )}
 
+          {summaryData.assignedTeam && (
+            <div style={{ marginBottom: '16px' }}>
+              <div style={{ fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '4px' }}>Assigned Team</div>
+              <div style={{ fontSize: '14px', fontWeight: 500, color: 'var(--info)' }}>{summaryData.assignedTeam}</div>
+            </div>
+          )}
+
           {summaryData.summary && (
             <div>
               <div style={{ fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '4px' }}>Complaint Summary</div>

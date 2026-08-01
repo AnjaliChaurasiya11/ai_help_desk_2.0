@@ -112,6 +112,7 @@ class Ticket(SQLModel, table=True):
     complainant_rank       : Optional[str]  = Field(default=None, max_length=50)
     complainant_unit       : Optional[str]  = Field(default=None, max_length=100)
     assignee_id            : Optional[str]  = Field(default=None, max_length=100)
+    assigned_team          : Optional[str]  = Field(default=None, max_length=100)
     created_at             : Optional[datetime] = Field(default_factory=datetime.utcnow)
     created_by_service_no  : Optional[str]  = Field(default=None, max_length=20)
 

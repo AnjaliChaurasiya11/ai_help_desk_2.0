@@ -126,6 +126,7 @@ def _enrich_candidates(
             enriched.append({
                 "application_id":   app_obj.id,
                 "application_name": app_obj.name,
+                "owning_team":      app_obj.owning_team or "",
                 "confidence_score": round(cand["score"], 4),
                 "is_primary":       False,   # will be set after re-sorting
                 "expansion_reason": None,
@@ -225,6 +226,7 @@ def _expand_dependencies(
                 enriched_candidates.append({
                     "application_id":   d_id,
                     "application_name": d_app.name,
+                    "owning_team":      d_app.owning_team or "",
                     "confidence_score": 0.0,
                     "is_primary":       False,
                     "expansion_reason": f"Cascade from {fault_type}",

@@ -328,7 +328,8 @@ function VoiceSessionPanel({ onClassificationComplete, onCancel, onCallEnded, re
         {
           intake_id: data.intake_id,
           ticket_number: data.ticket_number || null,
-          application: data.application || null,
+          application: data.application || data.application_name || null,
+          assigned_team: data.assigned_team || null,
           is_repeat_caller: false,
           potential_duplicates: [],
           fault_type_proposal: data.fault_type_proposal,

@@ -32,7 +32,7 @@ function TicketBlock({ index, ticket, candidates, onUpdate, onRemove, canRemove 
       <div style={{ marginBottom: '10px' }}>
         <div style={cardTitle}>Primary Application</div>
         {candidates.map(c => (
-          <div key={c.application_id} onClick={() => onUpdate(index, { ...ticket, selectedAppId: c.application_id, noMatch: false })}
+          <div key={c.application_id} onClick={() => onUpdate(index, { ...ticket, selectedAppId: c.application_id, assignedTeam: c.owning_team || "", noMatch: false })}
             style={{
               display: 'flex', alignItems: 'center', gap: '12px',
               padding: '8px 12px', borderRadius: '8px', cursor: 'pointer', marginBottom: '4px',
@@ -52,7 +52,7 @@ function TicketBlock({ index, ticket, candidates, onUpdate, onRemove, canRemove 
         ))}
 
         {/* R-17: unclassified path — abstain rather than force a wrong label */}
-        <div onClick={() => set('noMatch', true)}
+        <div onClick={() => onUpdate(index, { ...ticket, noMatch: true, selectedAppId: null, assignedTeam: "" })}
           style={{
             display: 'flex', alignItems: 'center', gap: '12px',
             padding: '8px 12px', borderRadius: '8px', cursor: 'pointer', marginTop: '2px',
@@ -80,6 +80,17 @@ function TicketBlock({ index, ticket, candidates, onUpdate, onRemove, canRemove 
           </select>
           <div style={{ marginTop: '6px', height: '3px', borderRadius: '2px', background: SEVERITY_COLOR[ticket.severity] || 'var(--border)' }} />
         </div>
+      </div>
+
+      <div style={{ marginTop: '12px' }}>
+        <div style={cardTitle}>Assigned Team</div>
+        <select value={ticket.assignedTeam || ""} onChange={e => set('assignedTeam', e.target.value)} style={selectStyle} disabled={ticket.noMatch}>
+          <option value="">-- Unassigned (Sent to Triage) --</option>
+          <option value="Network Team">Network Team</option>
+          <option value="HRMS Team">HRMS Team</option>
+          <option value="Medical IT Team">Medical IT Team</option>
+          <option value="Finance Systems Team">Finance Systems Team</option>
+        </select>
       </div>
 
       <div style={{ marginTop: '12px' }}>
@@ -154,16 +165,18 @@ function ClassifyReview() {
     ? (reanalysisResult.needs_followup ?? false)
     : needs_followup;
 
-  const defaultTicket = (cands, faultType, severity, forceUnselected = false) => ({
-    selectedAppId: forceUnselected
-      ? null
-      : ((cands ?? activeCandidates).find(c => c.is_primary)?.application_id ?? (cands ?? activeCandidates)[0]?.application_id ?? null),
-    relatedAppIds: (cands ?? activeCandidates).filter(c => !c.is_primary).map(c => c.application_id),
-    faultType: faultType ?? activeFaultTypeProposal,
-    severity: severity ?? activeSeverityProposal,
-    notes: '',
-    noMatch: false,
-  });
+  const defaultTicket = (cands, faultType, severity, forceUnselected = false) => {
+    const defaultCand = (cands ?? activeCandidates).find(c => c.is_primary) ?? (cands ?? activeCandidates)[0];
+    return {
+      selectedAppId: forceUnselected ? null : (defaultCand?.application_id ?? null),
+      assignedTeam: forceUnselected ? "" : (defaultCand?.owning_team ?? ""),
+      relatedAppIds: (cands ?? activeCandidates).filter(c => !c.is_primary).map(c => c.application_id),
+      faultType: faultType ?? activeFaultTypeProposal,
+      severity: severity ?? activeSeverityProposal,
+      notes: '',
+      noMatch: false,
+    };
+  };
 
   const [tickets,  setTickets]  = useState([defaultTicket(undefined, undefined, undefined, needs_followup)]);
   const [loading,  setLoading]  = useState(false);
@@ -227,6 +240,7 @@ function ClassifyReview() {
           predicted_severity:   activeSeverityProposal,
           edited_raw_text:      editedComplaint,
           voice_session_id:     originalForm.voice_session_id || undefined,
+          assigned_team:        t.assignedTeam || undefined,
         };
         const res = await confirmTicket(payload);
 

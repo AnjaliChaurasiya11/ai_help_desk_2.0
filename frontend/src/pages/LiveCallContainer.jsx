@@ -10,6 +10,7 @@ export default function LiveCallContainer() {
     setSummaryData({
       ticketNumber: intakeResponse.ticket_number || `#${intakeResponse.intake_id}`,
       application: intakeResponse.application || null,
+      assignedTeam: intakeResponse.assigned_team || null,
       status: 'Open',
       faultType: intakeResponse.fault_type_proposal,
       severity: intakeResponse.severity_proposal,

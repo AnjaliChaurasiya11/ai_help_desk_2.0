@@ -56,6 +56,7 @@ class ComplaintProcessingResult:
     fault_type: Optional[str] = None
     severity: Optional[str] = None
     application_name: Optional[str] = None     # Primary application display name
+    assigned_team: Optional[str] = None        # Team assigned via create_ticket
     candidates: List[VoiceCandidateApp] = field(default_factory=list)
     timings: dict = field(default_factory=dict)
 
@@ -200,6 +201,7 @@ def process_complaint_transcript(
     # Initialise here so they are always defined regardless of which branch runs
     ticket_number: Optional[str] = None
     app_name: Optional[str] = None
+    assigned_team: Optional[str] = None
 
     if state.needs_followup and state.followup_question:
 
@@ -224,39 +226,33 @@ def process_complaint_transcript(
 
         # ── Auto-create the Ticket so the summary shows a real TIC-YYYYMM-XXXX ──
         try:
-            from routers.tickets import _generate_ticket_number
-            from models import Ticket, TicketHistory
-            from sqlalchemy import text as sa_text
+            from services.ticket_service import create_ticket
 
             intake_obj = db_session.get(Intake, result.intake_id) if result.intake_id else None
-            if intake_obj and primary_app_id:
-                ticket_number = _generate_ticket_number(db_session)
-                ticket = Ticket(
-                    ticket_number=ticket_number,
+            app_obj = db_session.get(Application, primary_app_id) if primary_app_id else None
+
+            if intake_obj and app_obj:
+                ticket_res = create_ticket(
+                    session=db_session,
                     intake_id=intake_obj.id,
-                    primary_application_id=primary_app_id,
-                    status="open",
-                    fault_type=result.fault_type,
-                    severity=result.severity,
-                    complainant_service_no=intake_obj.complainant_service_no,
-                    complainant_rank=intake_obj.complainant_rank,
-                    complainant_unit=intake_obj.complainant_unit,
-                    assignee_id=None,
+                    confirmed_app_id=app_obj.id,
+                    related_app_ids=[],
+                    confirmed_fault_type=result.fault_type or "other",
+                    confirmed_severity=result.severity or "normal",
+                    operator_notes="Ticket auto-created by Live AI Support voice call.",
+                    predicted_app_id=app_obj.id,
+                    predicted_fault_type=result.fault_type or "other",
+                    predicted_severity=result.severity or "normal",
                     created_by_service_no=complainant_service_no or "voice-agent",
+                    edited_raw_text=None,
+                    voice_session_id=None,  # Pass None to bypass R-42 multi-complaint loop (1 call = 1 ticket)
+                    assigned_team=app_obj.owning_team,
                 )
-                db_session.add(ticket)
-                history = TicketHistory(
-                    ticket_number=ticket_number,
-                    changed_by="voice-agent",
-                    old_status="",
-                    new_status="open",
-                    notes="Ticket auto-created by Live AI Support voice call.",
-                )
-                db_session.add(history)
-                db_session.commit()
+                ticket_number = ticket_res["ticket_number"]
+                assigned_team = ticket_res["routed_to_team"]
                 logger.info(
-                    "[voice.CP] Auto-created ticket %s for intake_id=%s",
-                    ticket_number, result.intake_id,
+                    "[voice.CP] Auto-created ticket %s for intake_id=%s, assigned to %s",
+                    ticket_number, result.intake_id, assigned_team,
                 )
         except Exception as tc_exc:
             logger.error("[voice.CP] Failed to auto-create ticket: %s", tc_exc, exc_info=True)
@@ -282,6 +278,7 @@ def process_complaint_transcript(
         fault_type           = result.fault_type,
         severity             = result.severity,
         application_name     = app_name if result.status not in ("rejected", "unable_to_identify", "pending_clarification") else None,
+        assigned_team        = assigned_team,
         candidates           = voice_candidates,
         timings              = timings,
         confidence           = state.confidence,

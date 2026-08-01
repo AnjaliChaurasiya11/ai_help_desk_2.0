@@ -136,7 +136,7 @@ function TicketDetail() {
   const [saving,      setSaving]      = useState(false);
   const [error,       setError]       = useState(null);
   const [update,      setUpdate]      = useState({
-    new_status: '', notes: '', changed_by: 'system', assignee_id: '',
+    new_status: '', notes: '', changed_by: 'system', assigned_team: '',
   });
 
   const load = useCallback(async () => {
@@ -152,7 +152,7 @@ function TicketDetail() {
         new_status: found.status,
         notes: '',
         changed_by: 'system',
-        assignee_id: found.assignee_id || '',
+        assigned_team: found.assigned_team || '',
       });
 
       const isOpen = !CLOSED_STATUSES.includes(found.status);
@@ -187,7 +187,7 @@ function TicketDetail() {
         new_status:  update.new_status,
         notes:       update.notes || '',
         changed_by:  update.changed_by || 'system',
-        assignee_id: update.assignee_id || null,
+        assigned_team: update.assigned_team || null,
       });
       toast.success('Ticket updated!');
       load();
@@ -222,11 +222,9 @@ function TicketDetail() {
             <div style={{ fontSize: '15px', fontWeight: 500, color: 'var(--text-primary)' }}>
               {ticket.primary_application_name ?? 'Unclassified'}
             </div>
-            {ticket.assignee_id && (
-              <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-                👤 Assigned to: <strong>{ticket.assignee_id}</strong>
-              </div>
-            )}
+            <div style={{ marginTop: '8px', fontSize: '14px' }}>
+              👥 Assigned Team: <strong>{ticket.assigned_team || 'Unassigned'}</strong>
+            </div>
           </div>
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             <Badge label={ticket.severity} color={SEVERITY_COLOR[ticket.severity]} bg={(SEVERITY_COLOR[ticket.severity] || '#888') + '22'} />
@@ -304,16 +302,19 @@ function TicketDetail() {
             </div>
 
             <div>
-              <label style={labelStyle}>
-                Assign To <span style={{ color: 'var(--text-muted)' }}>(service no. or name)</span>
-              </label>
-              <input
-                value={update.assignee_id}
-                onChange={e => setUpdate(p => ({ ...p, assignee_id: e.target.value }))}
-                placeholder="e.g. 12345P or Cpl. Kumar"
+              <label style={labelStyle}>Assigned Team</label>
+              <select
+                value={update.assigned_team}
+                onChange={e => setUpdate(p => ({ ...p, assigned_team: e.target.value }))}
                 style={selectStyle}
                 disabled={isClosed}
-              />
+              >
+                <option value="">-- Unassigned --</option>
+                <option value="Network Team">Network Team</option>
+                <option value="HRMS Team">HRMS Team</option>
+                <option value="Medical IT Team">Medical IT Team</option>
+                <option value="Finance Systems Team">Finance Systems Team</option>
+              </select>
             </div>
 
             <div>
